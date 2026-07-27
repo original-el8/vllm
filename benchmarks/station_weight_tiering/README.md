@@ -4,6 +4,12 @@ This runbook separates hardware characterization from model-serving results.
 Run both parts on the same Station software image and retain the JSON, server
 logs, model revision, and container digest together.
 
+Any SM103 GB300 can validate cubins and kernel behavior. Treat host-tier
+bandwidth as representative of DGX Station only when the rental also exposes a
+Grace host and coherent NVLink-C2C access to host memory. A PCIe-attached
+GB300, or a partition with a different NVL topology, is a kernel-validation
+host rather than a Station memory-tier proxy.
+
 ## 1. Characterize the memory paths
 
 The probe requires an SM103 GPU and intentionally exits with status 2 on a
