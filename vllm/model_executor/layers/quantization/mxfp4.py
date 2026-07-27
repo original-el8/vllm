@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
+    TRTLLM_BACKENDS,
     Mxfp4MoeBackend,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
     convert_weight_to_mxfp4_moe_kernel_format,
@@ -41,6 +42,7 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -774,10 +776,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        cache_size = getattr(layer, "_moe_expert_cache_size", 0)
+        if cache_size > 0 and self.is_monolithic:
+            self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
+                self.moe,
+                prefer_modular=True,
+            )
+        if cache_size > 0 and not self.supports_expert_lru_cache:
+            raise ValueError(
+                f"--moe-expert-cache-size={cache_size} is incompatible with "
+                f"the {self.mxfp4_backend.value} MXFP4 MoE backend."
+            )
+
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         mxfp4_block = 32
+        use_cpu_pinned = cache_size > 0
+
+        def allocate_expert_tensor(
+            *shape: int,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            if use_cpu_pinned:
+                return torch.zeros(
+                    *shape,
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            return torch.zeros(*shape, dtype=dtype)
 
         layer.params_dtype = params_dtype
         layer.num_experts = num_experts
@@ -786,7 +814,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
-            torch.zeros(
+            allocate_expert_tensor(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
@@ -798,7 +826,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w13_weight_scale = torch.nn.Parameter(
-            torch.zeros(
+            allocate_expert_tensor(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
@@ -812,7 +840,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
-            torch.zeros(
+            allocate_expert_tensor(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
@@ -833,7 +861,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
         w2_weight_scale = torch.nn.Parameter(
-            torch.zeros(
+            allocate_expert_tensor(
                 num_experts,
                 hidden_size,
                 w2_scale_cols,
@@ -854,7 +882,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.moe.has_bias:
             w13_bias = torch.nn.Parameter(
-                torch.zeros(
+                allocate_expert_tensor(
                     num_experts,
                     2 * intermediate_size_per_partition,
                     dtype=torch.bfloat16,
@@ -865,7 +893,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w13_bias, extra_weight_attrs)
 
             w2_bias = torch.nn.Parameter(
-                torch.zeros(
+                allocate_expert_tensor(
                     num_experts,
                     hidden_size,
                     dtype=torch.bfloat16,
@@ -990,18 +1018,63 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if self.mxfp4_backend == Mxfp4MoeBackend.B12X:
                 self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
+    @property
+    def supports_expert_lru_cache(self) -> bool:
+        """True when the MXFP4 kernel is modular and accepts remapped IDs."""
+        compatible_backends = (
+            *TRTLLM_BACKENDS,
+            Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+            Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
+        )
+        return (
+            current_platform.is_cuda()
+            and not self.is_monolithic
+            and self.mxfp4_backend in compatible_backends
+        )
+
     def process_weights_after_loading(self, layer):
+        # When expert LRU cache is requested, prefer modular kernel classes
+        # that accept externally-provided topk_ids. Monolithic kernels
+        # perform internal routing and are incompatible with ID remapping.
+        cache_size = getattr(layer, "_moe_expert_cache_size", 0)
+        if cache_size > 0 and self.is_monolithic:
+            logger.info(
+                "MXFP4 expert cache: re-selecting backend with "
+                "prefer_modular=True (kernel was monolithic)."
+            )
+            self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
+                self.moe,
+                prefer_modular=True,
+            )
+            if self.is_monolithic:
+                raise ValueError(
+                    f"--moe-expert-cache-size={cache_size} requires a modular "
+                    f"MXFP4 MoE kernel, but backend {self.mxfp4_backend!r} "
+                    f"only provides monolithic kernels. Fallback not "
+                    f"available. Use a different MoE backend or reduce "
+                    f"--moe-expert-cache-size."
+                )
+
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
         w2_scale = layer.w2_weight_scale
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
+        if cache_size > 0 and w13.device.type != "cuda":
+            raise RuntimeError(
+                "MXFP4 expert-cache conversion must run inside "
+                "device_loading_context on the target CUDA device."
+            )
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+
+        # Initialize expert LRU cache when requested and compatible.
+        if self.supports_expert_lru_cache:
+            layer._maybe_init_expert_lru_cache()
 
     def get_fused_moe_quant_config(
         self,
@@ -1053,16 +1126,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+
+        provider = getattr(layer, "expert_weight_provider", None)
+        if provider is not None:
+            result = provider.prepare(topk_ids)
+            w1 = result.w1
+            w2 = result.w2
+            topk_ids = result.topk_ids
+            global_num_experts = provider.capacity
+        else:
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
+            global_num_experts = layer.global_num_experts
+
         return self.moe_kernel.apply(
             hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
+            w1=w1,
+            w2=w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
+            global_num_experts=global_num_experts,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            expert_map=layer.expert_map,
+            expert_map=None if provider is not None else layer.expert_map,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )

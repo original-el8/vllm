@@ -2349,6 +2349,37 @@ class VllmConfig:
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_moe_expert_cache(self) -> "VllmConfig":
+        if self.model_config is None:
+            return self
+        if (
+            self.offload_config.moe_expert_cache_size > 0
+            and not self.model_config.enforce_eager
+        ):
+            raise ValueError(
+                "--moe-expert-cache-size requires --enforce-eager. "
+                "The expert LRU cache uses dynamic Python state in prepare() "
+                "that is incompatible with CUDA graph capture."
+            )
+        if (
+            self.offload_config.moe_expert_cache_size > 0
+            and self.parallel_config.use_ubatching
+        ):
+            raise ValueError(
+                "--moe-expert-cache-size is not compatible with DBO or "
+                "microbatching. The cache has one mutable slot bank per layer."
+            )
+        if (
+            self.offload_config.moe_expert_cache_size > 0
+            and self.lora_config is not None
+        ):
+            raise ValueError(
+                "--moe-expert-cache-size is not compatible with LoRA. "
+                "Per-expert LoRA tensors are not cache-slot remapped."
+            )
+        return self
+
 
 _current_vllm_config: VllmConfig | None = None
 _current_prefix: str | None = None

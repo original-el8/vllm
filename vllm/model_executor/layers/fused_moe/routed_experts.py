@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -25,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.model_executor.virtual_tp import (
     get_virtual_tp_axis_shard_size,
     is_virtual_tp_padded_enabled,
@@ -32,6 +34,9 @@ from vllm.model_executor.virtual_tp import (
 )
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+        CachedWeightProvider,
+    )
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
 
 
@@ -96,6 +101,28 @@ class RoutedExperts(PluggableLayer):
         self.global_num_experts = moe_config.num_experts
         self.local_num_experts = moe_config.num_local_experts
         self.params_dtype = params_dtype
+        self.expert_weight_provider: CachedWeightProvider | None = None
+        self._moe_expert_cache_size = (
+            get_current_vllm_config().offload_config.moe_expert_cache_size
+        )
+        parallel_config = self.moe_config.moe_parallel_config
+        if self._moe_expert_cache_size > 0 and parallel_config.use_ep:
+            raise ValueError(
+                "moe_expert_cache_size is not compatible with expert "
+                f"parallelism (ep_size={parallel_config.ep_size})."
+            )
+        if self._moe_expert_cache_size > 0 and (
+            parallel_config.dp_size > 1 or parallel_config.is_sequence_parallel
+        ):
+            raise ValueError(
+                "moe_expert_cache_size is not compatible with data parallelism "
+                "or sequence parallelism."
+            )
+        if self._moe_expert_cache_size > 0 and self.moe_config.is_lora_enabled:
+            raise ValueError(
+                "moe_expert_cache_size is not compatible with MoE LoRA. "
+                "Cache-slot IDs do not remap per-expert LoRA tensors."
+            )
 
         # Register buffers for state_dict compatibility
         self.update_expert_map_info()
@@ -175,8 +202,132 @@ class RoutedExperts(PluggableLayer):
             )
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        if (
+            self._moe_expert_cache_size > 0
+            and not self.quant_method.supports_expert_lru_cache
+        ):
+            raise ValueError(
+                "--moe-expert-cache-size is not supported by "
+                f"{self.quant_method.__class__.__name__}."
+            )
 
         self.lora_base_layer_prefix = ""
+
+    def _maybe_init_expert_lru_cache(self) -> None:
+        """Initialize the expert weight provider after weight loading."""
+        if self._moe_expert_cache_size == 0:
+            return
+        if self.expert_weight_provider is not None:
+            raise RuntimeError(
+                "MoE expert cache weight reload is not supported. Restart the "
+                "engine to load a different checkpoint."
+            )
+        if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
+            raise ValueError(
+                "moe_expert_cache_size requires w13_weight and w2_weight "
+                f"parameters but they are missing on layer {self.layer_name}."
+            )
+        if (
+            self.w13_weight.ndim == 0
+            or self.w2_weight.ndim == 0
+            or self.w13_weight.size(0) != self.local_num_experts
+            or self.w2_weight.size(0) != self.local_num_experts
+        ):
+            raise ValueError(
+                "Expert LRU cache requires kernel weights with a leading "
+                f"expert dimension of {self.local_num_experts}; layer "
+                f"{self.layer_name} uses an incompatible packed layout."
+            )
+        if self.moe_config.has_bias:
+            logger.info(
+                "Expert LRU cache layer %s: including %s bytes of per-expert "
+                "biases in the pinned backing store and device slots.",
+                self.layer_name,
+                sum(
+                    getattr(self, name, torch.empty(0)).numel()
+                    * getattr(self, name, torch.empty(0)).element_size()
+                    for name in ("w13_bias", "w2_bias")
+                ),
+            )
+
+        from vllm.model_executor.layers.fused_moe.expert_weight_provider import (
+            CachedWeightProvider,
+        )
+
+        quant_config = self.quant_method.moe_quant_config
+        w13_scale = quant_config._w1.scale if quant_config is not None else None
+        w2_scale = quant_config._w2.scale if quant_config is not None else None
+        if (
+            quant_config is not None
+            and quant_config.weight_quant_dtype is not None
+            and (
+                not isinstance(w13_scale, torch.Tensor)
+                or not isinstance(w2_scale, torch.Tensor)
+            )
+        ):
+            raise ValueError(
+                "Expert LRU cache requires tensor-backed per-expert weight scales."
+            )
+        if not isinstance(w13_scale, torch.Tensor):
+            w13_scale = None
+        if not isinstance(w2_scale, torch.Tensor):
+            w2_scale = None
+        if (w13_scale is None) != (w2_scale is None):
+            raise ValueError(
+                "Expert LRU cache requires both expert weight scales or neither."
+            )
+
+        w13_bias = quant_config.w1_bias if quant_config is not None else None
+        w2_bias = quant_config.w2_bias if quant_config is not None else None
+
+        capacity = min(self._moe_expert_cache_size, self.local_num_experts)
+        self.expert_weight_provider = CachedWeightProvider(
+            capacity=capacity,
+            w13_weight=self.w13_weight.data,
+            w2_weight=self.w2_weight.data,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            w13_bias=w13_bias,
+            w2_bias=w2_bias,
+        )
+
+        if quant_config is not None:
+            if self.expert_weight_provider.buf_w13_scale is not None:
+                quant_config._w1.scale = self.expert_weight_provider.buf_w13_scale
+                quant_config._w2.scale = self.expert_weight_provider.buf_w2_scale
+            if self.expert_weight_provider.buf_w13_bias is not None:
+                quant_config._w1.bias = self.expert_weight_provider.buf_w13_bias
+            if self.expert_weight_provider.buf_w2_bias is not None:
+                quant_config._w2.bias = self.expert_weight_provider.buf_w2_bias
+
+        source_tensors = tuple(
+            tensor
+            for tensor in (w13_scale, w2_scale, w13_bias, w2_bias)
+            if isinstance(tensor, torch.Tensor)
+        )
+        source_ids = {id(tensor) for tensor in source_tensors}
+        source_storage = {
+            (tensor.device, tensor.data_ptr())
+            for tensor in source_tensors
+            if tensor.numel() > 0
+        }
+        for name, param in tuple(self.named_parameters(recurse=False)):
+            is_cached_weight = name in ("w13_weight", "w2_weight")
+            is_cached_aux = id(param) in source_ids or (
+                param.numel() > 0 and (param.device, param.data_ptr()) in source_storage
+            )
+            if is_cached_weight or is_cached_aux:
+                replace_parameter(
+                    self,
+                    name,
+                    torch.empty(0, dtype=param.dtype, device=param.device),
+                )
+        logger.info(
+            "Expert LRU cache enabled for %s: %d/%d experts cached on GPU.",
+            self.layer_name,
+            capacity,
+            self.local_num_experts,
+        )
 
     # TODO(bnell): Temporary hack. Get rid of this.
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
@@ -645,6 +796,11 @@ class RoutedExperts(PluggableLayer):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        if self.expert_weight_provider is not None:
+            raise RuntimeError(
+                "MoE expert cache weight reload is not supported. Restart the "
+                "engine to load a different checkpoint."
+            )
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined
