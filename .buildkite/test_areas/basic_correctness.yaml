@@ -11,11 +11,13 @@ steps:
   - tests/basic_correctness/test_basic_correctness
   - tests/basic_correctness/test_cpu_offload
   - tests/basic_correctness/test_mem.py
+  - tests/basic_correctness/test_moe_expert_cache
   commands:
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
   - pytest -v -s basic_correctness/test_mem.py
   - pytest -v -s basic_correctness/test_basic_correctness.py
   - pytest -v -s basic_correctness/test_cpu_offload.py
+  - pytest -v -s basic_correctness/test_moe_expert_cache.py
   mirror:
     amd:
       device: mi325_1

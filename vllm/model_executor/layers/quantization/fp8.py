@@ -606,6 +606,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
+    @property
+    def supports_expert_lru_cache(self) -> bool:
+        from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+        _compatible_backends = {
+            Fp8MoeBackend.TRITON,
+            Fp8MoeBackend.VLLM_CUTLASS,
+        }
+        # Block-quant scales are multi-dimensional and cannot be remapped
+        # per slot; backends that reorder weights into opaque layouts
+        # (DEEPGEMM, MARLIN, AITER, FLASHINFER) are also incompatible.
+        return (
+            current_platform.is_cuda()
+            and not self.block_quant
+            and self.fp8_backend in _compatible_backends
+        )
+
     def __init__(self, quant_config: Fp8Config, layer: RoutedExperts):
         super().__init__(layer.moe_config)
         self.quant_config = quant_config
@@ -651,6 +668,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         assert self.quant_config.is_checkpoint_fp8_serialized
         params_dtype = torch.float8_e4m3fn
 
+        cache_size = getattr(layer, "_moe_expert_cache_size", 0)
+        if cache_size > 0 and not self.supports_expert_lru_cache:
+            raise ValueError(
+                f"--moe-expert-cache-size={cache_size} is incompatible with "
+                f"the {self.fp8_backend.value} FP8 MoE backend."
+            )
+        use_cpu_pinned = cache_size > 0
+
+        def allocate_expert_tensor(
+            factory,
+            *shape: int,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            if use_cpu_pinned:
+                return factory(
+                    *shape,
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            return factory(*shape, dtype=dtype)
+
         if self.block_quant:
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
@@ -679,7 +718,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
-            torch.empty(
+            allocate_expert_tensor(
+                torch.empty,
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
@@ -691,7 +731,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w2_weight = torch.nn.Parameter(
-            torch.empty(
+            allocate_expert_tensor(
+                torch.empty,
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
@@ -705,7 +746,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # BIASES (for models like GPT-OSS that have biased MoE)
         if self.moe.has_bias:
             w13_bias = torch.nn.Parameter(
-                torch.zeros(
+                allocate_expert_tensor(
+                    torch.zeros,
                     num_experts,
                     2 * intermediate_size_per_partition,
                     dtype=layer.orig_dtype,
@@ -715,7 +757,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
             w2_bias = torch.nn.Parameter(
-                torch.zeros(num_experts, hidden_size, dtype=layer.orig_dtype),
+                allocate_expert_tensor(
+                    torch.zeros,
+                    num_experts,
+                    hidden_size,
+                    dtype=layer.orig_dtype,
+                ),
                 requires_grad=False,
             )
             layer.register_parameter("w2_bias", w2_bias)
@@ -724,17 +771,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHT_SCALES
         if not self.block_quant:
             # For per-tensor quant, the scales are per expert and weight.
-            w13_scale_data = torch.ones(num_experts, 2, dtype=torch.float32)
-            w2_scale_data = torch.ones(num_experts, dtype=torch.float32)
+            w13_scale_data = allocate_expert_tensor(
+                torch.ones,
+                num_experts,
+                2,
+                dtype=torch.float32,
+            )
+            w2_scale_data = allocate_expert_tensor(
+                torch.ones,
+                num_experts,
+                dtype=torch.float32,
+            )
         else:
             # For block quant, the scales are per block (typically 128x128).
-            w13_scale_data = torch.ones(
+            w13_scale_data = allocate_expert_tensor(
+                torch.ones,
                 num_experts,
                 2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                 (hidden_size + block_k - 1) // block_k,
                 dtype=torch.float32,
             )
-            w2_scale_data = torch.ones(
+            w2_scale_data = allocate_expert_tensor(
+                torch.ones,
                 num_experts,
                 (hidden_size + block_n - 1) // block_n,
                 (intermediate_size_per_partition + block_k - 1) // block_k,
@@ -829,6 +887,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w2_scale = getattr(layer, f"w2_{self.weight_scale_name}")
         w13_input_scale = layer.w13_input_scale
         w2_input_scale = layer.w2_input_scale
+        if (
+            getattr(layer, "_moe_expert_cache_size", 0) > 0
+            and w13.device.type != "cuda"
+        ):
+            raise RuntimeError(
+                "FP8 expert-cache conversion must run inside "
+                "device_loading_context on the target CUDA device."
+            )
 
         # MI300x and MI325x use FNUZ format for FP8. Convert if needed.
         if current_platform.is_fp8_fnuz():
@@ -865,6 +931,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self._setup_kernel(
             layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
         )
+
+        # Initialize expert LRU cache when requested and compatible.
+        if self.supports_expert_lru_cache:
+            layer._maybe_init_expert_lru_cache()
+
+        # Prevent duplicate processing (e.g., during weight reload)
+        layer._already_called_process_weights_after_loading = True
 
     def maybe_make_prepare_finalize(
         self,
@@ -945,6 +1018,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+
+        provider = getattr(layer, "expert_weight_provider", None)
+        if provider is not None:
+            result = provider.prepare(topk_ids)
+            return self.moe_kernel.apply(
+                x,
+                result.w1,
+                result.w2,
+                topk_weights,
+                result.topk_ids,
+                activation=layer.activation,
+                global_num_experts=provider.capacity,
+                expert_map=None,
+                apply_router_weight_on_input=(layer.apply_router_weight_on_input),
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
+
         return self.moe_kernel.apply(
             x,
             layer.w13_weight,

@@ -4,6 +4,9 @@
     "CUDA_VERSION": {
       "default": "13.0.2"
     },
+    "CUDA_WHEEL_VERSION": {
+      "default": "13.0.2"
+    },
     "PYTHON_VERSION": {
       "default": "3.12"
     },
@@ -57,6 +60,9 @@
     },
     "DEEPEP_COMMIT_HASH": {
       "default": "73b6ea4"
+    },
+    "deepep_cuda_arch_list": {
+      "default": "9.0a 10.0a"
     },
     "GIT_REPO_CHECK": {
       "default": "0"
