@@ -202,6 +202,9 @@ if TYPE_CHECKING:
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+    VLLM_DCP_QUERY_SPLIT: bool = False
+    VLLM_DCP_TOPK_OWNER_MERGE: bool = False
+    VLLM_DCP_TOPK_OWNER_MERGE_DIAGNOSTICS: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
@@ -1687,6 +1690,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gather DCP-sharded C4 records before B12X sparse-MLA prefill. This avoids
     # query replication plus the per-rank LSE combine and is opt-in while the
     # path is being qualified on GLM5Next.
+    "VLLM_DCP_QUERY_SPLIT": lambda: (
+        os.getenv("VLLM_DCP_QUERY_SPLIT", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    # Merge each prefill row's candidates on one DCP rank, then gather IDs.
+    "VLLM_DCP_TOPK_OWNER_MERGE": lambda: (
+        os.getenv("VLLM_DCP_TOPK_OWNER_MERGE", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DCP_TOPK_OWNER_MERGE_DIAGNOSTICS": lambda: (
+        os.getenv("VLLM_DCP_TOPK_OWNER_MERGE_DIAGNOSTICS", "0") == "1"
+    ),
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
     ),
