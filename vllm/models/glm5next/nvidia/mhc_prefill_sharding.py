@@ -106,7 +106,6 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
     from vllm.distributed import get_tp_group
 
     group = get_tp_group()
-    inplace_gather = envs.VLLM_GLM53_MHC_INPLACE_GATHER
     mixed_shard = envs.VLLM_GLM53_MHC_MIXED_SHARD
     partial_shard = envs.VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD
     error = None
@@ -149,7 +148,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
     votes: list[Any] = [None] * group.world_size
     torch.distributed.all_gather_object(
         votes,
-        (enabled, error, inplace_gather, mixed_shard, partial_shard),
+        (enabled, error, mixed_shard, partial_shard),
         group=group.cpu_group,
     )
     if any(vote[0] != enabled for vote in votes):
@@ -157,20 +156,15 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
     errors = [vote[1] for vote in votes if vote[1] is not None]
     if errors:
         raise RuntimeError("GLM mHC configuration admission failed: " + repr(errors))
-    if any(vote[2] != inplace_gather for vote in votes):
-        raise RuntimeError("All TP ranks must agree on mHC in-place gathering")
-    if inplace_gather and not enabled:
-        raise RuntimeError("mHC in-place gathering requires prefill row ownership")
-    if any(vote[3] != mixed_shard for vote in votes):
+    if any(vote[2] != mixed_shard for vote in votes):
         raise RuntimeError("All TP ranks must agree on mixed mHC row ownership")
     if mixed_shard and not enabled:
         raise RuntimeError("Mixed mHC requires prefill row ownership")
-    if any(vote[4] != partial_shard for vote in votes):
+    if any(vote[3] != partial_shard for vote in votes):
         raise RuntimeError("All TP ranks must agree on partial prefill mHC ownership")
     if partial_shard and not enabled:
         raise RuntimeError("Partial prefill mHC requires prefill row ownership")
     model._mhc_prefill_enabled = enabled
-    model._mhc_inplace_gather = inplace_gather
     model._mhc_mixed_shard = mixed_shard
     model._mhc_partial_prefill_shard = partial_shard
     model._mhc_prefill_parallel_config = config.parallel_config
@@ -377,7 +371,6 @@ class PrefillOwnership:
     diagnostic_forward: int = 0
     mhc_rows: dict[str, dict[int, int]] = field(default_factory=dict)
     dispatcher: Any = None
-    inplace_gather: bool = False
 
     def record_mhc(self, stage: str, output: Any) -> None:
         """Count the output rows of an mHC call that returned to the host."""
@@ -425,26 +418,11 @@ class PrefillOwnership:
         self.rs_count += 1
         return output
 
-    def gather_buffer(self, owned: Any) -> Any:
-        """Allocate a distinct gather result whose local slice can receive mHC."""
-        self._check(owned, self.rows // 4)
-        return owned.new_empty((self.rows, *owned.shape[1:]))
-
-    def all_gather(self, owned: Any, output: Any = None) -> Any:
+    def all_gather(self, owned: Any) -> Any:
         from vllm.utils.torch_utils import current_stream
 
         self._check(owned, self.rows // 4)
-        if output is None:
-            output = self.gather_buffer(owned)
-        else:
-            self._check(output, self.rows)
-            if (
-                tuple(output.shape) != (self.rows, *owned.shape[1:])
-                or owned.data_ptr() != self.local_view(output).data_ptr()
-            ):
-                raise RuntimeError(
-                    "mHC gather input must alias its rank's output slice"
-                )
+        output = owned.new_empty((self.rows, *owned.shape[1:]))
         stream = current_stream()
         if self.dispatcher is None:
             self.comm.all_gather(output, owned, stream=stream)
@@ -637,7 +615,6 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         )
         _PARTIAL_REPORTS += 1
     return PrefillOwnership(
-        inplace_gather=model._mhc_inplace_gather,
         dispatcher=group.device_communicator,
         comm=comm,
         rank=group.rank_in_group,
