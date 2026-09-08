@@ -999,6 +999,16 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
         """Whether this call attends a transient globally gathered DCP cache."""
         return False
 
+    def get_mqa_partitions(
+        self, attn_metadata: T, num_tokens: int
+    ) -> tuple[tuple[int, int, T], ...]:
+        """Return contiguous row ranges with their attention metadata.
+
+        Ranges cover every MQA row in order. Each range completes its output
+        projection before the following range reuses attention workspace.
+        """
+        return ((0, num_tokens, attn_metadata),)
+
     @abstractmethod
     def __init__(
         self,

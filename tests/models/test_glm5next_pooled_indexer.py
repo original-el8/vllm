@@ -76,6 +76,253 @@ def owner_merge_group():
     destroy_distributed_environment()
 
 
+@torch.inference_mode()
+def test_mixed_ckv_attention_matches_full_dcp_at_high_pages(owner_merge_group):
+    """Compare real mixed attention, including native cache copies above 2 GiB."""
+    from dataclasses import replace
+
+    from vllm.config import VllmConfig
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.utils.b12x import get_b12x_sparse_mla
+    from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
+    from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+    from vllm.v1.attention.ops.dcp import MLADCPManager
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    device = _require_glm_gpu()
+    group = owner_merge_group
+    assert group.world_size == 4
+    rank = group.rank_in_group
+    init_workspace_manager(device)
+    module = get_b12x_sparse_mla()
+    assert module is not None and module.is_supported()
+    query_lens = [1, 4, 257, 129]
+    rows = sum(query_lens)
+    width, heads, page_size, record_bytes = 2051, 16, 512, 528
+    # Leave padding after each page as the hybrid cache does. The selected
+    # pages exceed signed 32-bit byte addressing on every rank.
+    page_stride = (page_size + 64) * record_bytes
+    high_page = 2**31 // page_stride + 32
+    storage = torch.empty(
+        (high_page + 40) * page_stride, dtype=torch.uint8, device=device
+    )
+    cache = torch.as_strided(
+        storage,
+        (high_page + 40, page_size, record_bytes),
+        (page_stride, record_bytes, 1),
+    )
+    pages = high_page + (torch.arange(8, device=device) * 7 + rank * 3) % 32
+    block_table = pages.to(torch.int32).reshape(4, 2)
+    assert int(block_table.min()) * cache.stride(0) > 2**31
+    topk = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    impl = object.__new__(B12xMLASparseImpl)
+    for name, value in {
+        "_module": module,
+        "_bind": module.bind,
+        "_run": module.run,
+        "_is_glm_next": True,
+        "_physical_selection_provider": None,
+        "_uses_nvfp4_cache": False,
+        "_model_type": int(module.ModelType.GLM_NEXT),
+        "_max_tokens": rows,
+        "_max_seqs": 4,
+        "_max_speculative_decode_query_len": 6,
+        "_decode_max_rows": 24,
+        "_input_num_heads": heads * 4,
+        "num_heads": heads,
+        "dcp_world_size": 4,
+        "dcp_rank": rank,
+        "_q_head_dim": 512,
+        "kv_lora_rank": 512,
+        "_topk_tokens": width,
+        "_kv_dtype": torch.uint8,
+        "scale": 256**-0.5,
+        "need_to_return_lse_for_decode": True,
+        "_ckv_gather_enabled": True,
+        "_ckv_capacity_tokens": 2048,
+        "_kernel_page_size": 0,
+        "_kernel_page_size_finalized": True,
+        "supports_quant_query_input": False,
+        "topk_indices_buffer": topk,
+    }.items():
+        setattr(impl, name, value)
+    impl._set_kernel_page_size(page_size)
+    impl._reserve_attention_workspaces()
+    config = VllmConfig()
+    config.parallel_config.dcp_comm_backend = "a2a"
+    manager = MLADCPManager(
+        vllm_config=config,
+        device=device,
+        num_heads=heads,
+        query_head_dim=512,
+        output_head_dim=512,
+        query_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        padded_num_heads=None,
+        is_lse_base_on_e=True,
+        use_pcp=False,
+    )
+    torch.manual_seed(410 + rank)
+    q = torch.randn(rows + 3, heads, 256, dtype=torch.bfloat16, device=device) / 8
+    weight = torch.randn(heads, 256, 512, dtype=torch.bfloat16, device=device) / 16
+    owner = SimpleNamespace(
+        impl=impl,
+        num_heads=heads,
+        v_head_dim=512,
+        qk_nope_head_dim=256,
+        qk_rope_head_dim=0,
+        kv_cache_dtype="fp8_ds_mla",
+        use_pcp=False,
+        prefill_backend=None,
+        q_pad_num_heads=None,
+        _try_fused_mla_query=lambda *a: None,
+        is_aiter_triton_fp4_bmm_enabled=False,
+        is_aiter_triton_fp8_bmm_enabled=False,
+        is_amx_bmm_enabled=False,
+        W_UK_T=weight,
+        dcp_manager=manager,
+        _v_up_proj=lambda attention_output, out: out.copy_(attention_output.flatten(1)),
+    )
+    starts = torch.tensor([0, 1, 5, 262, rows], dtype=torch.int32, device=device)
+    req_ids = torch.repeat_interleave(
+        torch.arange(4, dtype=torch.int32, device=device),
+        torch.tensor(query_lens, device=device),
+    )
+    previous = None
+    for mutation in range(2):
+        global_lens = torch.tensor(
+            [1537, 2081, 1161, 1789], dtype=torch.int32, device=device
+        )
+        global_lens += mutation * 3
+        local_lens = get_dcp_local_seq_lens(global_lens, 4, rank, 4)
+        local_values = []
+        slots = []
+        causal: list[int] = []
+        for req, length in enumerate(local_lens.tolist()):
+            token = torch.arange(length, device=device)
+            values = torch.sin(
+                token[:, None] * 0.071
+                + torch.arange(512, device=device)[None, :] * 0.019
+                + rank * 0.73
+                + req * 0.41
+                + mutation * 0.37
+            ).to(torch.bfloat16)
+            local_values.append(values)
+            slots.append(
+                block_table[req, token // page_size].long() * page_size
+                + token % page_size
+            )
+            length = int(global_lens[req])
+            causal.extend(range(length - query_lens[req] + 1, length + 1))
+        module.concat_and_cache_glm_next_mla_fp8(
+            torch.cat(local_values), cache, torch.cat(slots)
+        )
+        topk.fill_(-1)
+        for row, length in enumerate(causal):
+            count = 113 + row % 16
+            topk[row, :count] = (
+                (
+                    (torch.arange(count, device=device) * 7 + row * 3 + mutation * 11)
+                    % length
+                )
+                .sort()
+                .values.to(torch.int32)
+            )
+        rank_lens = get_dcp_local_seq_lens(global_lens[2:], 4, None, 4).T.contiguous()
+        rank_starts = torch.zeros_like(rank_lens)
+        rank_starts[:, 1:] = rank_lens[:, :-1].cumsum(1)
+        cu_lens = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=device),
+                rank_lens[rank].cumsum(0).int(),
+            )
+        )
+        padded = (int(rank_lens.sum(1).max()) + 511) // 512 * 512
+        metadata = B12xMLASparseMetadata(
+            num_reqs=4,
+            max_query_len=257,
+            max_seq_len=int(global_lens.max()),
+            num_actual_tokens=rows,
+            query_start_loc=starts,
+            slot_mapping=torch.full((rows,), -1, dtype=torch.int64, device=device),
+            block_table=block_table,
+            req_id_per_token=req_ids,
+            seq_lens=local_lens,
+            num_decodes=2,
+            num_prefills=2,
+            num_decode_tokens=5,
+            block_size=page_size,
+            cp_kv_cache_interleave_size=4,
+            cache_seq_lens_per_token=get_dcp_local_seq_lens(
+                torch.tensor(causal, dtype=torch.int32, device=device), 4, rank, 4
+            ),
+            dcp_ckv_gather_eligible=True,
+            dcp_mixed_ckv_gather_eligible=True,
+            dcp_local_total_tokens=int(cu_lens[-1]),
+            dcp_padded_total_tokens=padded,
+            dcp_rank_req_lens=rank_lens,
+            dcp_rank_req_starts=rank_starts,
+            dcp_local_cu_seq_lens=cu_lens,
+            global_cache_seq_lens_per_req=global_lens[2:],
+            ckv_selected_indices=torch.empty(
+                rows - 5, width, dtype=torch.int32, device=device
+            ),
+            ckv_active_counts=torch.empty(rows - 5, dtype=torch.int32, device=device),
+        )
+        outputs = []
+        for mixed in (False, True):
+            out = torch.full(
+                (rows + 3, heads * 512), -17, dtype=torch.bfloat16, device=device
+            )
+            MLAAttention.forward_impl(
+                owner,
+                q,
+                q[:, 0],
+                q[:, :1, :0],
+                cache,
+                replace(metadata, dcp_mixed_ckv_gather_eligible=mixed),
+                out,
+            )
+            outputs.append(out.clone())
+        torch.accelerator.synchronize()
+        reference, actual = outputs
+        assert torch.isfinite(actual).all() and actual[:rows].abs().max() > 0.01
+        assert actual[rows:].eq(-17).all()
+        torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+        cosine = torch.nn.functional.cosine_similarity(
+            actual[:rows].float().flatten(), reference[:rows].float().flatten(), dim=0
+        )
+        assert cosine > 0.999
+        # Check the selected-token identity independently of attention values.
+        for row in (5, 6, 261, 262, rows - 1):
+            req = int(req_ids[row]) - 2
+            valid = topk[row][topk[row] >= 0]
+            owners = valid // 4 % 4
+            local = valid // 16 * 4 + valid % 4
+            expected = owners * padded + rank_starts[owners, req] + local
+            count = int(metadata.ckv_active_counts[row - 5])
+            assert count == valid.numel()
+            torch.testing.assert_close(
+                metadata.ckv_selected_indices[row - 5, :count], expected
+            )
+        if previous is not None:
+            assert (actual[:rows] - previous[:rows]).abs().max() > 0.05
+        previous = actual
+        q.mul_(0.9)
+        print(
+            "MIXED_CKV_GPU",
+            {
+                "rank": rank,
+                "mutation": mutation,
+                "max_abs_error": float((actual - reference).abs().max()),
+                "cosine": float(cosine),
+                "minimum_page": int(block_table.min()),
+                "minimum_byte_offset": int(block_table.min()) * page_stride,
+            },
+            flush=True,
+        )
+
+
 def test_mhc_gather_bound_output_preserves_values_streams_and_replay(owner_merge_group):
     """Compare the serving mHC binding and rank-local NCCL alias with fresh output."""
     from vllm.distributed.parallel_state import get_tp_group

@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     VLLM_UMA_SERVING_HEADROOM_GIB: float = 0.0
     VLLM_TRIM_STARTUP_HEAP: bool = False
     VLLM_TRIM_SERVING_HEAP_INTERVAL: float = 0.0
+    VLLM_B12X_MLA_MIXED_CKV_GATHER: bool = False
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
@@ -1679,6 +1680,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Seconds between host heap checks; zero disables the CPU-only policy.
     "VLLM_TRIM_SERVING_HEAP_INTERVAL": lambda: float(
         os.getenv("VLLM_TRIM_SERVING_HEAP_INTERVAL", "0")
+    ),
+    "VLLM_B12X_MLA_MIXED_CKV_GATHER": lambda: bool(
+        int(os.getenv("VLLM_B12X_MLA_MIXED_CKV_GATHER", "0"))
     ),
     "VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS": lambda: bool(
         int(os.getenv("VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS", "0"))

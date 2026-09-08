@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Behavior checks for the B12x sparse MLA adapters."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -728,6 +729,248 @@ def test_b12x_full_ckv_gather_uses_global_causal_lengths() -> None:
     assert actual.tolist() == [4, 5, 10, 11, 12]
 
 
+def _mixed_ckv_metadata() -> B12xMLASparseMetadata:
+    query_lens = torch.tensor([1, 4, 17, 23], dtype=torch.int32)
+    return B12xMLASparseMetadata(
+        num_reqs=4,
+        max_query_len=23,
+        max_seq_len=117,
+        num_actual_tokens=45,
+        query_start_loc=torch.tensor([0, 1, 5, 22, 45], dtype=torch.int32),
+        slot_mapping=torch.arange(45, dtype=torch.int64) + 100,
+        block_table=torch.tensor([[16, 29], [37, 42], [57, 68], [93, 107]]),
+        req_id_per_token=torch.repeat_interleave(torch.arange(4), query_lens),
+        seq_lens=torch.tensor([21, 29, 18, 25], dtype=torch.int32),
+        num_decodes=2,
+        num_prefills=2,
+        num_decode_tokens=5,
+        block_size=16,
+        cache_seq_lens_per_token=torch.arange(45, dtype=torch.int32) + 3,
+        selector_state_slot_ids=torch.tensor([13, 5, 17, 2], dtype=torch.int32),
+        selector_state_is_fresh=torch.tensor([False, False, False, True]),
+        selector_num_accepted_tokens=torch.tensor([1, 3, 1, 1]),
+        selector_is_prefilling=torch.tensor([False, False, True, True]),
+        dcp_ckv_gather_eligible=True,
+        dcp_mixed_ckv_gather_eligible=True,
+        dcp_padded_total_tokens=64,
+        dcp_local_total_tokens=43,
+        ckv_selected_indices=torch.empty(40, 8, dtype=torch.int32),
+        ckv_active_counts=torch.empty(40, dtype=torch.int32),
+        dcp_rank_req_lens=torch.tensor([[18, 25]] * 4, dtype=torch.int32),
+        dcp_rank_req_starts=torch.tensor([[0, 18]] * 4, dtype=torch.int32),
+        dcp_local_cu_seq_lens=torch.tensor([0, 18, 43], dtype=torch.int32),
+        global_cache_seq_lens_per_req=torch.tensor([72, 99], dtype=torch.int32),
+    )
+
+
+def _mixed_ckv_impl(monkeypatch) -> B12xMLASparseImpl:
+    impl = object.__new__(B12xMLASparseImpl)
+    impl._ckv_gather_enabled = True
+    impl._kernel_page_size_finalized = True
+    impl._ckv_local_capacity = 128
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    return impl
+
+
+def test_mixed_ckv_partitions_preserve_request_identity(monkeypatch) -> None:
+    metadata = _mixed_ckv_metadata()
+    originals = {
+        name: value.clone()
+        for name, value in vars(metadata).items()
+        if isinstance(value, torch.Tensor)
+    }
+    impl = _mixed_ckv_impl(monkeypatch)
+    partitions = impl.get_mqa_partitions(metadata, 45)
+    assert [(start, end) for start, end, _ in partitions] == [(0, 5), (5, 45)]
+    decode, prefill = [part[2] for part in partitions]
+    assert not impl.uses_full_ckv_dcp(metadata, 45)
+    assert not impl.uses_full_ckv_dcp(decode, 5)
+    assert impl.uses_full_ckv_dcp(prefill, 40)
+    assert (decode.num_decodes, decode.num_prefills, decode.max_query_len) == (2, 0, 23)
+    assert decode.is_spec_decode == metadata.is_spec_decode
+    assert decode.query_start_loc.tolist() == [0, 1, 5]
+    assert decode.req_id_per_token.tolist() == [0, 1, 1, 1, 1]
+    assert decode.selector_state_slot_ids.tolist() == [13, 5]
+    assert prefill.query_start_loc.tolist() == [0, 17, 40]
+    assert prefill.req_id_per_token.tolist() == [0] * 17 + [1] * 23
+    assert prefill.selector_state_slot_ids.tolist() == [17, 2]
+    assert prefill.topk_token_offset == 5
+    torch.testing.assert_close(prefill.block_table, metadata.block_table[2:])
+    torch.testing.assert_close(prefill.slot_mapping, metadata.slot_mapping[5:])
+    torch.testing.assert_close(
+        prefill.cache_seq_lens_per_token, metadata.cache_seq_lens_per_token[5:]
+    )
+    causal = _global_causal_lens_for_ckv_gather(
+        prefill.global_cache_seq_lens_per_req,
+        prefill.query_start_loc,
+        prefill.req_id_per_token,
+        40,
+    )
+    assert causal.tolist() == list(range(56, 73)) + list(range(77, 100))
+    for name, original in originals.items():
+        torch.testing.assert_close(getattr(metadata, name), original)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "disabled",
+        "capture",
+        "capacity",
+        "padded",
+        "missing",
+        "pure_decode",
+        "pure_prefill",
+    ],
+)
+def test_mixed_ckv_partitions_fail_closed(monkeypatch, reason: str) -> None:
+    impl = _mixed_ckv_impl(monkeypatch)
+    metadata = _mixed_ckv_metadata()
+    num_tokens = 45
+    if reason == "disabled":
+        metadata.dcp_mixed_ckv_gather_eligible = False
+    elif reason == "capture":
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    elif reason == "capacity":
+        impl._ckv_local_capacity = 32
+    elif reason == "padded":
+        num_tokens = 48
+    elif reason == "missing":
+        metadata.dcp_rank_req_lens = None
+    elif reason == "pure_decode":
+        metadata.num_decode_tokens = 45
+    elif reason == "pure_prefill":
+        metadata.num_decodes = metadata.num_decode_tokens = 0
+    assert impl.get_mqa_partitions(metadata, num_tokens) == ((0, num_tokens, metadata),)
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mixed_ckv_builder_gathers_only_prefill_requests(monkeypatch, rank, enabled):
+    metadata = _mixed_ckv_metadata()
+    metadata.dcp_ckv_gather_eligible = False
+    metadata.dcp_mixed_ckv_gather_eligible = False
+    monkeypatch.setattr(
+        SparseMLACommonMetadataBuilder, "build", lambda *a, **kw: replace(metadata)
+    )
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    monkeypatch.setenv("VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS", "16")
+    builder = _bare_glm_selector_metadata_builder()
+    builder._ckv_gather_requested = True
+    builder._mixed_ckv_gather_requested = enabled
+    builder._ckv_max_reqs = 4
+    builder.dcp_world_size = 4
+    builder.dcp_rank = rank
+    builder.cp_kv_cache_interleave_size = 4
+    builder.kv_cache_spec = SimpleNamespace(block_size=16)
+    builder.cache_seq_lens_per_token_buffer = torch.empty(45, dtype=torch.int32)
+    builder.ckv_selected_indices_buffer = torch.empty(45, 8, dtype=torch.int32)
+    builder.ckv_active_counts_buffer = torch.empty(45, dtype=torch.int32)
+    builder.dcp_rank_req_lens_buffer = torch.empty(4, 4, dtype=torch.int32)
+    builder.dcp_rank_req_starts_buffer = torch.empty(4, 4, dtype=torch.int32)
+    builder.dcp_local_cu_seq_lens_buffer = torch.empty(5, dtype=torch.int32)
+    seq_lens = torch.tensor([81, 117, 72, 99], dtype=torch.int32)
+    common = SimpleNamespace(
+        num_actual_tokens=45,
+        num_reqs=4,
+        max_query_len=23,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens,
+        seq_lens_cpu_upper_bound=None,
+        dcp_local_seq_lens=b12x_mla_sparse.get_dcp_local_seq_lens(seq_lens, 4, rank, 4),
+        query_start_loc_cpu=metadata.query_start_loc,
+        is_prefilling=metadata.selector_is_prefilling,
+    )
+    actual = builder._build(
+        0,
+        common,
+        for_cudagraph_capture=False,
+        selector_state_slot_ids=metadata.selector_state_slot_ids,
+        selector_state_is_fresh=metadata.selector_state_is_fresh,
+        selector_num_accepted_tokens=metadata.selector_num_accepted_tokens,
+        selector_is_prefilling=metadata.selector_is_prefilling,
+    )
+    assert actual.dcp_mixed_ckv_gather_eligible == enabled
+    assert actual.dcp_ckv_gather_eligible == enabled
+    if enabled:
+        assert actual.global_cache_seq_lens_per_req.tolist() == [72, 99]
+        assert actual.dcp_rank_req_lens.shape == (4, 2)
+        assert actual.ckv_selected_indices.shape == (40, 8)
+        assert actual.dcp_rank_req_lens.sum().item() == 171
+        assert actual.dcp_local_total_tokens < 50
+        assert actual.dcp_local_cu_seq_lens.shape == (3,)
+
+
+def test_mla_mixed_ckv_projects_each_partition_before_workspace_reuse(monkeypatch):
+    metadata = _mixed_ckv_metadata()
+    impl = _mixed_ckv_impl(monkeypatch)
+    events = []
+    workspace = torch.empty(45, 2, 4)
+    q = torch.arange(45 * 2 * 4, dtype=torch.float32).reshape(45, 2, 4) / 100
+    weight = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4) / 10
+
+    def gather(query):
+        events.append(("gather", query.shape[0]))
+        return query.repeat(1, 4, 1)
+
+    def attention(query, cache, part, layer):
+        assert query.shape[1] == (8 if part.num_decodes else 2)
+        events.append(("attention", part.topk_token_offset))
+        workspace.fill_(float("nan"))
+        rows = query.shape[0]
+        workspace[:rows].copy_(query[:, :2, :4])
+        return workspace[:rows], torch.ones(rows, 8)
+
+    def combine(output, lse, *, seq_lens, query_start_loc):
+        assert query_start_loc.tolist() == [0, 1, 5]
+        assert seq_lens.tolist() == [21, 29]
+        events.append(("combine", output.shape[0]))
+        return output
+
+    def project(attention_output, *, out):
+        events.append(("project", out.shape[0]))
+        out.copy_(attention_output.flatten(1))
+
+    owner = SimpleNamespace(
+        impl=SimpleNamespace(
+            is_sparse=True,
+            dcp_world_size=4,
+            get_mqa_partitions=impl.get_mqa_partitions,
+            uses_full_ckv_dcp=impl.uses_full_ckv_dcp,
+            forward_mqa=attention,
+        ),
+        num_heads=2,
+        v_head_dim=4,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=2,
+        kv_cache_dtype="auto",
+        use_pcp=False,
+        prefill_backend=None,
+        q_pad_num_heads=None,
+        _try_fused_mla_query=lambda *a: None,
+        is_aiter_triton_fp4_bmm_enabled=False,
+        is_aiter_triton_fp8_bmm_enabled=False,
+        is_amx_bmm_enabled=False,
+        W_UK_T=weight,
+        dcp_manager=SimpleNamespace(query_gather=gather, combine=combine),
+        _v_up_proj=project,
+    )
+    output = torch.full((48, 8), -17.0)
+    empty = torch.empty(0)
+    MLAAttention.forward_impl(owner, q, empty, empty, empty, metadata, output)
+    expected = torch.einsum("thp,hpl->thl", q[:, :, :2], weight).flatten(1)
+    torch.testing.assert_close(output[:45], expected)
+    assert output[45:].eq(-17).all()
+    assert events == [
+        ("gather", 5),
+        ("attention", 0),
+        ("combine", 5),
+        ("project", 5),
+        ("attention", 5),
+        ("project", 40),
+    ]
+
+
 def test_b12x_glm5_next_accepts_dcp_with_prefix_caching(monkeypatch) -> None:
     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
     with set_current_vllm_config(
@@ -1216,6 +1459,7 @@ def _bare_glm_selector_metadata_builder() -> B12xMLASparseMetadataBuilder:
     builder.requires_glm_next_selector_metadata = True
     builder.supports_draft_decode_metadata_update = True
     builder._ckv_gather_requested = False
+    builder._mixed_ckv_gather_requested = False
     builder.dcp_world_size = 1
     builder._max_speculative_decode_query_len = 6
     builder._capture_default_state_slot_ids = torch.arange(4, dtype=torch.int32)
@@ -1408,6 +1652,7 @@ def test_b12x_sparse_mla_spec_decode_lengths_stay_in_builder_buffer(
     builder = B12xMLASparseMetadataBuilder.__new__(B12xMLASparseMetadataBuilder)
     builder.requires_glm_next_selector_metadata = False
     builder._ckv_gather_requested = False
+    builder._mixed_ckv_gather_requested = False
     builder.dcp_world_size = 1
     builder._max_speculative_decode_query_len = 4
     builder.cache_seq_lens_per_token_buffer = torch.zeros(16, dtype=torch.int32)
