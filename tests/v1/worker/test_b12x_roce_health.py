@@ -13,6 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import vllm.distributed.parallel_state as parallel_state
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import Worker, _B12xRoceCheckedAsyncOutput
@@ -32,6 +33,11 @@ def _worker_with_communicator(monkeypatch, comm) -> Worker:
     worker = Worker.__new__(Worker)  # no GPU, no init: only the helpers are used
     group = SimpleNamespace(device_communicator=SimpleNamespace(b12x_ar_comm=comm))
     monkeypatch.setattr(gpu_worker_module, "get_tp_group", lambda: group)
+    monkeypatch.setattr(
+        parallel_state,
+        "_apply_to_device_comms",
+        lambda action: action(group.device_communicator),
+    )
     return worker
 
 
@@ -93,3 +99,27 @@ def test_no_roce_communicator_means_no_wrapping(monkeypatch):
         assert worker._b12x_roce_guarded(output) is output
         async_output = _AsyncOutput(output, [])
         assert worker._b12x_roce_guarded(async_output) is async_output
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_subgroup_failure_prevents_output_release(monkeypatch, asynchronous):
+    tp = Mock()
+    subgroup = Mock()
+    subgroup.check_health.side_effect = RuntimeError("subgroup poisoned")
+    worker = _worker_with_communicator(monkeypatch, tp)
+    comms = [SimpleNamespace(b12x_ar_comm=c) for c in (tp, tp, subgroup)]
+    monkeypatch.setattr(
+        parallel_state,
+        "_apply_to_device_comms",
+        lambda action: [action(comm) for comm in comms],
+    )
+    output = _sync_output()
+    with pytest.raises(RuntimeError, match="subgroup poisoned"):
+        if asynchronous:
+            wrapped = worker._b12x_roce_guarded(_AsyncOutput(output, []))
+            tp.check_health.assert_not_called()
+            wrapped.get_output()
+        else:
+            worker._b12x_roce_guarded(output)
+    tp.check_health.assert_called_once_with()
+    subgroup.check_health.assert_called_once_with()

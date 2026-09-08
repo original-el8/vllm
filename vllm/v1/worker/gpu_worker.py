@@ -1109,14 +1109,32 @@ class Worker(WorkerBase):
         return self._b12x_roce_guarded(self.model_runner.sample_tokens(grammar_output))
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
-        """The RoCEnante health check of the TP communicator, if one is active.
+        """Snapshot health checks for every active parallel-group transport.
 
         Returns:
             The check callable, or None when RoCEnante is not in use.
         """
-        communicator = get_tp_group().device_communicator
-        comm = getattr(communicator, "b12x_ar_comm", None)
-        return getattr(comm, "check_health", None)
+        from vllm.distributed.parallel_state import _apply_to_device_comms
+
+        checks = []
+        seen = set()
+
+        def collect(communicator):
+            comm = getattr(communicator, "b12x_ar_comm", None)
+            check = getattr(comm, "check_health", None)
+            if check is not None and id(comm) not in seen:
+                seen.add(id(comm))
+                checks.append(check)
+
+        _apply_to_device_comms(collect)
+        if not checks:
+            return None
+
+        def check_all():
+            for check in checks:
+                check()
+
+        return check_all
 
     def _b12x_roce_guarded(self, output):
         """Fail-stop RoCEnante check once the step's output is on the host.

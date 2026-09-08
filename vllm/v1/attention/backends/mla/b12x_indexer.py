@@ -343,8 +343,11 @@ def _gather_indexer_row_ids(group, local_ids, all_ids) -> None:
     )
     local_ids = local_ids.contiguous()
     communicator = group.device_communicator
+    dispatch = getattr(communicator, "all_gather_into", None)
     pynccl = getattr(communicator, "pynccl_comm", None)
-    if pynccl is not None and not pynccl.disabled:
+    if dispatch is not None:
+        dispatch(output, local_ids)
+    elif pynccl is not None and not pynccl.disabled:
         pynccl.all_gather(output, local_ids)
     else:
         # PyTorch does not expose NCCL's in-place alias contract. Query-split
