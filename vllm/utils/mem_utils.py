@@ -83,6 +83,66 @@ def release_device_memory_under_pressure(device: torch.device) -> bool:
     return True
 
 
+class ServingMemoryReclaimer:
+    """Release UMA allocator cache between forwards under explicit host pressure.
+
+    Live tensors and CUDA graph pools retain their storage. Check at most once
+    per second and require 1 GiB of inactive reservations before synchronizing.
+    After a trim, require inactive reservation growth so graph-private
+    cache cannot cause repeated synchronization without reclaiming memory.
+    """
+
+    def __init__(self, device: torch.device, headroom_bytes: int) -> None:
+        self.device = device
+        self.headroom_bytes = headroom_bytes
+        self.enabled = (
+            headroom_bytes > 0
+            and device.type == "cuda"
+            and current_platform.is_integrated_gpu(device.index)
+        )
+        self._next_check = 0.0
+        self._inactive_after_trim = 0
+
+    def maybe_release(self) -> int:
+        """Return bytes released; callers must be outside graph capture."""
+        if not self.enabled:
+            return 0
+        now = time.monotonic()
+        if now < self._next_check:
+            return 0
+        self._next_check = now + 1.0
+        reserved = torch.accelerator.memory_reserved(self.device)
+        allocated = torch.accelerator.memory_allocated(self.device)
+        inactive = reserved - allocated
+        if inactive < max(GiB_bytes, self._inactive_after_trim + 256 * MiB_bytes):
+            return 0
+        available = psutil.virtual_memory().available
+        if available >= self.headroom_bytes:
+            return 0
+
+        from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+
+        start = time.monotonic()
+        # Pending stream work must finish before cached pages return to the OS.
+        with gpu_sync_allowed():
+            torch.accelerator.synchronize(self.device)
+            torch.accelerator.empty_cache()
+        reserved_after = torch.accelerator.memory_reserved(self.device)
+        self._inactive_after_trim = reserved_after - torch.accelerator.memory_allocated(
+            self.device
+        )
+        released = max(0, reserved - reserved_after)
+        self._next_check = time.monotonic() + 1.0
+        logger.info(
+            "UMA_SERVING_RECLAIM released=%.3fGiB available_before=%.3fGiB "
+            "elapsed_ms=%.3f",
+            released / GiB_bytes,
+            available / GiB_bytes,
+            (time.monotonic() - start) * 1000,
+        )
+        return released
+
+
 class DeviceMemoryProfiler:
     def __init__(self, device: torch.types.Device | None = None):
         self.device = device

@@ -265,6 +265,7 @@ class B12xMHCResidual:
         norm_weight: torch.Tensor,
         norm_eps: float,
         hc_fn_bf16: torch.Tensor | None = None,
+        y_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         expected_m = int(residual.shape[0])
         kwargs = {
@@ -278,6 +279,8 @@ class B12xMHCResidual:
             "fn_bf16": hc_fn_bf16,
         }
         if torch.compiler.is_compiling():
+            if y_out is not None:
+                raise RuntimeError("Caller-owned mHC output requires eager execution")
             return self._run_post_pre(
                 x,
                 residual,
@@ -292,9 +295,18 @@ class B12xMHCResidual:
 
         tokens, hc_mult, hidden_size = residual.shape
         residual_out = torch.empty_like(residual)
-        layer_input = torch.empty(
-            (tokens, hidden_size), dtype=residual.dtype, device=residual.device
-        )
+        layer_input = y_out
+        if layer_input is None:
+            layer_input = torch.empty(
+                (tokens, hidden_size), dtype=residual.dtype, device=residual.device
+            )
+        elif (
+            tuple(layer_input.shape) != (tokens, hidden_size)
+            or layer_input.device != residual.device
+            or layer_input.dtype != residual.dtype
+            or not layer_input.is_contiguous()
+        ):
+            raise ValueError("mHC output must match contiguous input rows and dtype")
         post_out = torch.empty(
             (tokens, hc_mult), dtype=torch.float32, device=residual.device
         )

@@ -192,7 +192,11 @@ if TYPE_CHECKING:
     VLLM_B12X_KDA_PREFILL_COALESCING: bool = False
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_GLM53_MHC_PREFILL_SHARD: bool = False
+    VLLM_GLM53_MHC_INPLACE_GATHER: bool = False
     VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS: bool = False
+    VLLM_UMA_SERVING_HEADROOM_GIB: float = 0.0
+    VLLM_TRIM_STARTUP_HEAP: bool = False
+    VLLM_TRIM_SERVING_HEAP_INTERVAL: float = 0.0
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
@@ -1661,6 +1665,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Restrict GLM mHC token ownership to eligible GB10 TP4/DCP4 eager prefills.
     "VLLM_GLM53_MHC_PREFILL_SHARD": lambda: bool(
         int(os.getenv("VLLM_GLM53_MHC_PREFILL_SHARD", "0"))
+    ),
+    "VLLM_GLM53_MHC_INPLACE_GATHER": lambda: bool(
+        int(os.getenv("VLLM_GLM53_MHC_INPLACE_GATHER", "0"))
+    ),
+    # Zero disables serving cache reclamation. This does not change the KV budget.
+    "VLLM_UMA_SERVING_HEADROOM_GIB": lambda: float(
+        os.getenv("VLLM_UMA_SERVING_HEADROOM_GIB", "0")
+    ),
+    "VLLM_TRIM_STARTUP_HEAP": lambda: bool(
+        int(os.getenv("VLLM_TRIM_STARTUP_HEAP", "0"))
+    ),
+    # Seconds between host heap checks; zero disables the CPU-only policy.
+    "VLLM_TRIM_SERVING_HEAP_INTERVAL": lambda: float(
+        os.getenv("VLLM_TRIM_SERVING_HEAP_INTERVAL", "0")
     ),
     "VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS": lambda: bool(
         int(os.getenv("VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS", "0"))

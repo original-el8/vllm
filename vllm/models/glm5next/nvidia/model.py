@@ -580,6 +580,7 @@ class Glm5NextDecoderLayer(nn.Module):
         if _l2pf.ENABLED and not self._l2pf_ready:
             self._l2pf_build_plans()
         x = hidden_states
+        gather_output = None
         first_full_pre = post is None
         if post is None:
             if self._b12x_mhc is not None:
@@ -611,6 +612,11 @@ class Glm5NextDecoderLayer(nn.Module):
                 post = mhc_prefill_ownership.local_view(post)
                 comb = mhc_prefill_ownership.local_view(comb)
         else:
+            if (
+                mhc_prefill_ownership is not None
+                and mhc_prefill_ownership.inplace_gather
+            ):
+                gather_output = mhc_prefill_ownership.gather_buffer(x)
             residual, post, comb, x = self.hc_fused_post_pre(
                 x,
                 residual,
@@ -621,6 +627,11 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                y_out=(
+                    mhc_prefill_ownership.local_view(gather_output)
+                    if gather_output is not None and mhc_prefill_ownership is not None
+                    else None
+                ),
             )
 
         # Attention needs the full token sequence; mHC above ran on the SP
@@ -628,7 +639,7 @@ class Glm5NextDecoderLayer(nn.Module):
         if mhc_prefill_ownership is not None:
             if not first_full_pre:
                 mhc_prefill_ownership.record_mhc("attention_post_pre", x)
-                x = mhc_prefill_ownership.all_gather(x)
+                x = mhc_prefill_ownership.all_gather(x, output=gather_output)
         elif self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
@@ -652,6 +663,9 @@ class Glm5NextDecoderLayer(nn.Module):
             _l2pf.issue(self._l2pf_plan_b, x.shape[0])
 
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
+        gather_output = None
+        if mhc_prefill_ownership is not None and mhc_prefill_ownership.inplace_gather:
+            gather_output = mhc_prefill_ownership.gather_buffer(x)
         residual, post, comb, x = self.hc_fused_post_pre(
             x,
             residual,
@@ -662,12 +676,17 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_base,
             norm_weight=self.post_attention_layernorm.weight,
             norm_eps=self.post_attention_layernorm.variance_epsilon,
+            y_out=(
+                mhc_prefill_ownership.local_view(gather_output)
+                if gather_output is not None and mhc_prefill_ownership is not None
+                else None
+            ),
         )
 
         # Fully Connected
         if mhc_prefill_ownership is not None:
             mhc_prefill_ownership.record_mhc("ffn_post_pre", x)
-            x = mhc_prefill_ownership.all_gather(x)
+            x = mhc_prefill_ownership.all_gather(x, output=gather_output)
             x = self.mlp(x, defer_tp_reduction=True)
             x = mhc_prefill_ownership.reduce_scatter(x)
         elif self._mlp_is_moe:
@@ -928,6 +947,7 @@ class Glm5NextDecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        y_out: torch.Tensor | None = None,
     ):
         if self._b12x_mhc is not None:
             return self._b12x_mhc.run_post_pre(
@@ -940,7 +960,10 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_base,
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
+                y_out=y_out,
             )
+        if y_out is not None:
+            raise RuntimeError("Caller-owned mHC output requires B12X")
         return self.mhc_fused_post_pre_op(
             x=x,
             residual=residual,
