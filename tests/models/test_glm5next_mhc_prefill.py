@@ -56,6 +56,7 @@ def metadata(**changes):
 def admission(monkeypatch):
     monkeypatch.setenv("VLLM_GLM53_MHC_INPLACE_GATHER", "0")
     monkeypatch.setenv("VLLM_GLM53_MHC_MIXED_SHARD", "0")
+    monkeypatch.setenv("VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", "0")
     comm = NS(
         available=True,
         disabled=False,
@@ -259,19 +260,101 @@ def test_mixed_metadata_must_agree_across_recurrent_layers():
     assert ownership.mixed_prefill_metadata({"first": item}, names, 4108) is None
 
 
-def test_mixed_flag_requires_existing_ownership_and_rank_agreement(
-    monkeypatch, admission
+@pytest.mark.parametrize(
+    "flag,index,description",
+    [
+        ("VLLM_GLM53_MHC_MIXED_SHARD", 3, "mixed"),
+        ("VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", 4, "partial prefill"),
+    ],
+)
+def test_batch_flags_require_existing_ownership_and_rank_agreement(
+    monkeypatch, admission, flag, index, description
 ):
-    monkeypatch.setenv("VLLM_GLM53_MHC_MIXED_SHARD", "1")
+    monkeypatch.setenv(flag, "1")
     with pytest.raises(RuntimeError, match="requires prefill"):
         ownership.configure(admission.model, admission.config, False)
 
     def vote(result, value, **kwargs):
-        result[:] = [value, (*value[:3], False), value, value]
+        other = list(value)
+        other[index] = False
+        result[:] = [value, tuple(other), value, value]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", vote)
-    with pytest.raises(RuntimeError, match="agree on mixed"):
+    with pytest.raises(RuntimeError, match=f"agree on {description}"):
         ownership.configure(admission.model, admission.config, True)
+
+
+@pytest.mark.parametrize(
+    "rows,changes,accepted",
+    [
+        (4096, {}, True),
+        (6144, {"num_prefills": 2}, True),
+        (8036, {}, True),
+        (8188, {}, True),
+        (4092, {}, False),
+        (4097, {}, False),
+        (8192, {}, False),
+        (4096, {"num_prefills": 17}, False),
+        (4096, {"num_decodes": 1, "num_decode_tokens": 1}, False),
+        (4096, {"num_spec_decodes": 1, "num_spec_decode_tokens": 4}, False),
+        (4096, {"num_actual_tokens": 4095}, False),
+        (4096, {"num_actual_tokens": None}, False),
+    ],
+)
+def test_partial_prefill_requires_complete_pure_unpadded_rows(rows, changes, accepted):
+    item = metadata(
+        **({"num_prefill_tokens": rows, "num_actual_tokens": rows} | changes)
+    )
+    result = ownership.partial_prefill_metadata({"gdn": item}, ("gdn",), rows)
+    assert (result is not None) == accepted
+
+
+@pytest.mark.parametrize("disagreement", ["none", "layer", "rank", "graph", "flag"])
+def test_partial_ownership_requires_agreed_request_geometry(
+    monkeypatch, admission, disagreement
+):
+    monkeypatch.setenv(
+        "VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", "0" if disagreement == "flag" else "1"
+    )
+    ownership.configure(admission.model, admission.config, True)
+    item = metadata(num_prefill_tokens=4096, num_actual_tokens=4096)
+    other = metadata(
+        num_prefills=2 if disagreement == "layer" else 1,
+        num_prefill_tokens=4096,
+        num_actual_tokens=4096,
+    )
+    context = NS(
+        cudagraph_runtime_mode=NS(name="FULL" if disagreement == "graph" else "NONE"),
+        ubatch_slices=None,
+        attn_metadata={"first": item, "second": other},
+    )
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    monkeypatch.setattr(ownership, "validate_model", lambda model: ("first", "second"))
+    if disagreement == "rank":
+
+        def vote(result, value, **kwargs):
+            signature = (2, *value[3][1:])
+            result[:] = [value, (*value[:3], signature), value, value]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", vote)
+    elif disagreement in ("graph", "flag"):
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_object",
+            lambda *a, **kw: pytest.fail("Ineligible shapes must not enter rank votes"),
+        )
+    hidden = NS(
+        shape=(4096, 4096),
+        is_cuda=True,
+        dtype=torch.bfloat16,
+        device=admission.group.device_communicator.pynccl_comm.device,
+    )
+    owner = ownership.maybe_create(admission.model, hidden, NS(shape=(4096,)))
+    if disagreement == "none":
+        assert owner is not None and owner.rows == 4096
+    else:
+        assert owner is None
 
 
 @pytest.mark.parametrize("peer_mismatch", [False, True])

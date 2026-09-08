@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
     VLLM_GLM53_MHC_PREFILL_SHARD: bool = False
     VLLM_GLM53_MHC_MIXED_SHARD: bool = False
+    VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD: bool = False
     VLLM_GLM53_MHC_INPLACE_GATHER: bool = False
     VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS: bool = False
     VLLM_UMA_SERVING_HEADROOM_GIB: float = 0.0
@@ -1670,6 +1671,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM53_MHC_MIXED_SHARD": lambda: bool(
         int(os.getenv("VLLM_GLM53_MHC_MIXED_SHARD", "0"))
+    ),
+    "VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD": lambda: bool(
+        int(os.getenv("VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", "0"))
     ),
     "VLLM_GLM53_MHC_INPLACE_GATHER": lambda: bool(
         int(os.getenv("VLLM_GLM53_MHC_INPLACE_GATHER", "0"))

@@ -324,11 +324,21 @@ def test_mixed_ckv_attention_matches_full_dcp_at_high_pages(owner_merge_group):
 
 
 @pytest.mark.parametrize(
-    "query_lens", [(1, 3, 8, 4096), (*([4] * 15), 7680), (4, 4, 4, 8180)]
+    "query_lens",
+    [
+        (4096,),
+        (2047, 2049),
+        (6144,),
+        (8036,),
+        (8188,),
+        (1, 3, 8, 4096),
+        (*([4] * 15), 7680),
+        (4, 4, 4, 8180),
+    ],
 )
 @torch.inference_mode()
-def test_mixed_mhc_model_rows_match_full_reduction(owner_merge_group, query_lens):
-    """Compare full and owned mHC state with uneven mixed rows and real TP sums."""
+def test_prefill_mhc_model_rows_match_full_reduction(owner_merge_group, query_lens):
+    """Compare full and owned mHC with pure/mixed rows and actual TP reductions."""
     from vllm.distributed.parallel_state import get_tp_group
     from vllm.models.deepseek_v4.nvidia.b12x import B12xMHCResidual
     from vllm.models.glm5next.nvidia.mhc_prefill_sharding import PrefillOwnership
@@ -368,7 +378,7 @@ def test_mixed_mhc_model_rows_match_full_reduction(owner_merge_group, query_lens
     stream.wait_stream(torch.cuda.current_stream())
     retained = []
     with torch.cuda.stream(stream):
-        # Request identity crosses both mHC ownership and decode/prefill boundaries.
+        # Unequal request lengths cross rank ownership boundaries.
         identity = (
             request_ids.to(torch.bfloat16)[:, None].expand(rows, 4096).contiguous()
         )
@@ -417,7 +427,7 @@ def test_mixed_mhc_model_rows_match_full_reduction(owner_merge_group, query_lens
                 assert cosine.item() > 0.999
             retained.append((actual, actual.clone(), actual_post, actual_post.clone()))
             print(
-                "MIXED_MHC_GPU",
+                "PREFILL_MHC_GPU",
                 {
                     "rank": rank,
                     "rows": rows,
