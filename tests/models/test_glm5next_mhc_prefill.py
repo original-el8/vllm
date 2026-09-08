@@ -55,6 +55,7 @@ def metadata(**changes):
 @pytest.fixture
 def admission(monkeypatch):
     monkeypatch.setenv("VLLM_GLM53_MHC_INPLACE_GATHER", "0")
+    monkeypatch.setenv("VLLM_GLM53_MHC_MIXED_SHARD", "0")
     comm = NS(
         available=True,
         disabled=False,
@@ -179,6 +180,139 @@ def test_only_pure_host_prefill_counts_admit_ownership(change):
         {"gdn": metadata(**change)}, ("gdn",), 8192
     )
     assert not ownership.pure_prefill_metadata({}, ("gdn",), 8192)
+
+
+@pytest.mark.parametrize(
+    "changes,rows,accepted",
+    [
+        ({}, 4108, True),
+        (
+            {
+                "num_prefill_tokens": 7680,
+                "num_spec_decodes": 15,
+                "num_spec_decode_tokens": 60,
+            },
+            7740,
+            True,
+        ),
+        (
+            {
+                "num_prefill_tokens": 6144,
+                "num_decodes": 1,
+                "num_decode_tokens": 1,
+                "num_spec_decodes": 1,
+                "num_spec_decode_tokens": 3,
+            },
+            6148,
+            True,
+        ),
+        ({"num_prefill_tokens": 4084}, 4096, False),
+        ({"num_prefill_tokens": 4095}, 4107, False),
+        ({"num_prefill_tokens": 8192}, 8204, False),
+        ({"num_prefills": 0}, 4108, False),
+        ({"num_spec_decodes": 0}, 4108, False),
+        ({"num_spec_decodes": 17}, 4108, False),
+        ({"num_decode_tokens": 1}, 4108, False),
+        ({"num_prefill_tokens": 4097}, 4108, False),
+        ({"num_actual_tokens": 4107}, 4108, False),
+        ({"num_spec_decode_tokens": None}, 4108, False),
+        ({"num_spec_decodes": True}, 4108, False),
+        ({"num_prefills": torch.tensor(1)}, 4108, False),
+    ],
+)
+def test_mixed_admission_requires_complete_unpadded_counts(changes, rows, accepted):
+    values = dict(
+        num_prefill_tokens=4096,
+        num_spec_decodes=3,
+        num_spec_decode_tokens=12,
+        num_actual_tokens=rows,
+    )
+    item = metadata(**(values | changes))
+    result = ownership.mixed_prefill_metadata({"gdn": item}, ("gdn",), rows)
+    assert (result is not None) == accepted
+
+
+def test_mixed_metadata_must_agree_across_recurrent_layers():
+    item = metadata(
+        num_prefill_tokens=4096,
+        num_spec_decodes=3,
+        num_spec_decode_tokens=12,
+        num_actual_tokens=4108,
+    )
+    different = metadata(
+        num_prefill_tokens=4096,
+        num_spec_decodes=4,
+        num_spec_decode_tokens=12,
+        num_actual_tokens=4108,
+    )
+    names = ("first", "second")
+    assert (
+        ownership.mixed_prefill_metadata({"first": item, "second": item}, names, 4108)
+        is not None
+    )
+    assert (
+        ownership.mixed_prefill_metadata(
+            {"first": item, "second": different}, names, 4108
+        )
+        is None
+    )
+    assert ownership.mixed_prefill_metadata({"first": item}, names, 4108) is None
+
+
+def test_mixed_flag_requires_existing_ownership_and_rank_agreement(
+    monkeypatch, admission
+):
+    monkeypatch.setenv("VLLM_GLM53_MHC_MIXED_SHARD", "1")
+    with pytest.raises(RuntimeError, match="requires prefill"):
+        ownership.configure(admission.model, admission.config, False)
+
+    def vote(result, value, **kwargs):
+        result[:] = [value, (*value[:3], False), value, value]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", vote)
+    with pytest.raises(RuntimeError, match="agree on mixed"):
+        ownership.configure(admission.model, admission.config, True)
+
+
+@pytest.mark.parametrize("peer_mismatch", [False, True])
+def test_mixed_ownership_uses_actual_rows_only_after_rank_vote(
+    monkeypatch, admission, peer_mismatch
+):
+    monkeypatch.setenv("VLLM_GLM53_MHC_MIXED_SHARD", "1")
+    ownership.configure(admission.model, admission.config, True)
+    item = metadata(
+        num_prefill_tokens=4096,
+        num_spec_decodes=3,
+        num_spec_decode_tokens=12,
+        num_actual_tokens=4108,
+    )
+    context = NS(
+        cudagraph_runtime_mode=NS(name="NONE"),
+        ubatch_slices=None,
+        attn_metadata={"gdn": item},
+    )
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    monkeypatch.setattr(ownership, "validate_model", lambda model: ("gdn",))
+    if peer_mismatch:
+
+        def vote(result, value, **kwargs):
+            other = (value[0], value[1], value[2] + 4, value[3])
+            result[:] = [value, other, value, value]
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", vote)
+    hidden = NS(
+        shape=(4108, 4096),
+        is_cuda=True,
+        dtype=torch.bfloat16,
+        device=admission.group.device_communicator.pynccl_comm.device,
+    )
+    result = ownership.maybe_create(admission.model, hidden, NS(shape=(4108,)))
+    assert (result is None) == peer_mismatch
+    if result is not None:
+        assert result.rows == 4108 and result.rows // 4 == 1027
+    admission.model._mhc_mixed_shard = False
+    assert ownership.maybe_create(admission.model, hidden, NS(shape=(4108,))) is None
 
 
 def test_peer_ineligible_metadata_falls_back_before_partial_outputs(

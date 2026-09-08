@@ -7,10 +7,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 _LOG = logging.getLogger(__name__)
 _REPORTS = 0
+_MIXED_REPORTS = 0
 
 
 @dataclass
@@ -105,6 +106,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
 
     group = get_tp_group()
     inplace_gather = envs.VLLM_GLM53_MHC_INPLACE_GATHER
+    mixed_shard = envs.VLLM_GLM53_MHC_MIXED_SHARD
     error = None
     if enabled:
         try:
@@ -144,7 +146,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
             error = str(exc)
     votes: list[Any] = [None] * group.world_size
     torch.distributed.all_gather_object(
-        votes, (enabled, error, inplace_gather), group=group.cpu_group
+        votes, (enabled, error, inplace_gather, mixed_shard), group=group.cpu_group
     )
     if any(vote[0] != enabled for vote in votes):
         raise RuntimeError("All TP ranks must agree on VLLM_GLM53_MHC_PREFILL_SHARD")
@@ -155,8 +157,13 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
         raise RuntimeError("All TP ranks must agree on mHC in-place gathering")
     if inplace_gather and not enabled:
         raise RuntimeError("mHC in-place gathering requires prefill row ownership")
+    if any(vote[3] != mixed_shard for vote in votes):
+        raise RuntimeError("All TP ranks must agree on mixed mHC row ownership")
+    if mixed_shard and not enabled:
+        raise RuntimeError("Mixed mHC requires prefill row ownership")
     model._mhc_prefill_enabled = enabled
     model._mhc_inplace_gather = inplace_gather
+    model._mhc_mixed_shard = mixed_shard
     model._mhc_prefill_parallel_config = config.parallel_config
     model._mhc_prefill_diagnostics = (
         PrefillDiagnostics(group.rank_in_group)
@@ -197,6 +204,50 @@ def pure_prefill_metadata(metadata: Any, names: tuple[str, ...], rows: int) -> b
         ):
             return False
     return True
+
+
+def mixed_prefill_metadata(
+    metadata: Any, names: tuple[str, ...], rows: int
+) -> tuple[int, ...] | None:
+    """Admit complete, consistent host counts for a large eager mixed batch."""
+    if (
+        not isinstance(metadata, dict)
+        or not names
+        or not 4096 <= rows <= 8192
+        or rows % 4
+    ):
+        return None
+    fields = (
+        "num_prefills",
+        "num_prefill_tokens",
+        "num_decodes",
+        "num_decode_tokens",
+        "num_spec_decodes",
+        "num_spec_decode_tokens",
+        "num_actual_tokens",
+    )
+    signature: tuple[int, ...] | None = None
+    for name in names:
+        item = metadata.get(name)
+        values = tuple(getattr(item, field, None) for field in fields)
+        if any(type(value) is not int or value < 0 for value in values):
+            return None
+        values = cast(tuple[int, ...], values)
+        prefills, prefill_rows, decodes, decode_rows, specs, spec_rows, actual = values
+        if (
+            prefills <= 0
+            or prefill_rows < 4096
+            or prefills + decodes + specs > 16
+            or decodes + specs <= 0
+            or decode_rows != decodes
+            or not specs <= spec_rows <= 4 * specs
+            or prefill_rows + decode_rows + spec_rows != rows
+            or actual != rows
+            or (signature is not None and signature != values)
+        ):
+            return None
+        signature = values
+    return signature
 
 
 def validate_moe_deferral(runner: Any) -> None:
@@ -423,6 +474,7 @@ class PrefillOwnership:
 
 
 def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | None:
+    global _MIXED_REPORTS
     diagnostics = getattr(model, "_mhc_prefill_diagnostics", None)
     if not getattr(model, "_mhc_prefill_enabled", False):
         if diagnostics is not None:
@@ -433,7 +485,16 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
     # Avoid Python diagnostic mutation while tracing a compiled graph.
     if torch.compiler.is_compiling():
         return None
-    if tuple(hidden.shape) != (8192, 4096):
+    rows = hidden.shape[0]
+    mixed_enabled = model._mhc_mixed_shard
+    shape_eligible = tuple(hidden.shape) == (8192, 4096) or (
+        mixed_enabled
+        and len(hidden.shape) == 2
+        and hidden.shape[1] == 4096
+        and 4096 <= rows <= 8192
+        and rows % 4 == 0
+    )
+    if not shape_eligible:
         if diagnostics is not None:
             diagnostics.decision("hidden_shape", shape=list(hidden.shape))
         return None
@@ -476,12 +537,20 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
     except (AttributeError, RuntimeError) as exc:
         names = ()
         error = str(exc)
+    mixed_signature = (
+        mixed_prefill_metadata(context.attn_metadata, names, rows)
+        if mixed_enabled
+        else None
+    )
     eligible = (
         error is None
-        and positions.shape[0] == 8192
+        and positions.shape[0] == rows
         and hidden.is_cuda
         and hidden.dtype == torch.bfloat16
-        and pure_prefill_metadata(context.attn_metadata, names, 8192)
+        and (
+            pure_prefill_metadata(context.attn_metadata, names, rows)
+            or mixed_signature is not None
+        )
     )
     if diagnostics is not None:
         details = metadata_diagnostics(context.attn_metadata, names)
@@ -497,7 +566,9 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
     # Rank-local capability or metadata differences cannot silently choose
     # incompatible reduction paths after one rank has produced partial output.
     votes: list[Any] = [None] * 4
-    torch.distributed.all_gather_object(votes, (eligible, error), group=group.cpu_group)
+    torch.distributed.all_gather_object(
+        votes, (eligible, error, rows, mixed_signature), group=group.cpu_group
+    )
     errors = [item[1] for item in votes if item[1] is not None]
     if errors:
         raise RuntimeError("mHC prefill capability vote failed: " + repr(errors))
@@ -505,17 +576,31 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         if diagnostics is not None:
             diagnostics.decision("peer_ineligible", votes=votes)
         return None
+    if any(item[2:] != votes[0][2:] for item in votes):
+        if diagnostics is not None:
+            diagnostics.decision("peer_geometry", votes=votes)
+        return None
     kind = "request"
     forward = 0
     if diagnostics is not None:
         kind = diagnostics.decision("admitted")
         diagnostics.admitted += 1
         forward = diagnostics.admitted
+    if mixed_signature is not None and _MIXED_REPORTS < 8:
+        _LOG.info(
+            "GLM_MHC_MIXED rank=%d rows=%d owner_rows=%d metadata=%s",
+            group.rank_in_group,
+            rows,
+            rows // 4,
+            mixed_signature,
+        )
+        _MIXED_REPORTS += 1
     return PrefillOwnership(
         inplace_gather=model._mhc_inplace_gather,
         dispatcher=group.device_communicator,
         comm=comm,
         rank=group.rank_in_group,
+        rows=rows,
         diagnostics=diagnostics,
         diagnostic_kind=kind,
         diagnostic_forward=forward,
