@@ -171,11 +171,27 @@ def test_ownership_all_gather_and_all_to_all_are_rank_identical(codec, monkeypat
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("codec", wire.CODECS)
 def test_triton_kernels_match_reference_on_gpu(codec):
+    """Kernel and reference agree up to rounding ties and one BF16 ulp of accumulation.
+
+    The kernel scales by a reciprocal and the reference divides, so values that
+    land exactly on a rounding tie may differ by one INT8 code; scales and the
+    decode must match exactly.
+    """
     x = _rows(64, seed=3).to("cuda")
     packed = wire.quantize_rows(x, codec=codec)
     reference = torch.empty_like(packed)
     wire._quantize_rows_reference(x, reference, codec=codec)
-    assert torch.equal(packed, reference)
+    payload = packed.view(torch.int8)[:, : wire.HIDDEN].int()
+    ref_payload = reference.view(torch.int8)[:, : wire.HIDDEN].int()
+    scales = packed.view(torch.float32)[:, wire.HIDDEN // 4 :]
+    ref_scales = reference.view(torch.float32)[:, wire.HIDDEN // 4 :]
+    assert torch.equal(scales, ref_scales)
+    if codec == "i8":
+        delta = (payload - ref_payload).abs()
+        assert delta.max().item() <= 1
+        assert (delta > 0).float().mean().item() < 1e-3
+    else:
+        assert torch.equal(payload, ref_payload)
     back = wire.dequantize_rows(packed, codec=codec)
     assert torch.equal(back, wire._dequantize_rows_reference(packed, codec=codec))
     shards = torch.stack(
@@ -185,6 +201,6 @@ def test_triton_kernels_match_reference_on_gpu(codec):
     expected = sum(
         wire._dequantize_rows_reference(shards[s], dtype=torch.float32, codec=codec)
         for s in range(4)
-    ).to(torch.bfloat16)
-    assert torch.equal(out, expected)
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=2**-7, atol=1e-6)
     torch.accelerator.synchronize()
