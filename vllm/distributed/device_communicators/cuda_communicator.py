@@ -516,7 +516,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
-        """Reduce into caller storage; unsupported RoCE reductions use NCCL."""
+        """Reduce into caller storage through NCCL on the supplied stream."""
         dim = dim + input_.ndim if dim < 0 else dim
         if not 0 <= dim < input_.ndim:
             raise ValueError("reduce-scatter axis is outside the input dimensions")
@@ -532,18 +532,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             raise ValueError("reduce-scatter output has incompatible metadata")
         with torch.cuda.stream(stream):
-            roce = self.b12x_ar_comm
-            if (
-                roce is not None
-                and envs.VLLM_ROCE_CALLER_COLLECTIVES
-                and getattr(roce, "backend_name", None) == "B12X_ROCENANTE"
-                and roce.should_reduce_scatter(input_, dim)
-            ):
-                roce.reduce_scatter(input_, out=output, stream=stream)
-                self._trace_collective(
-                    "reduce_scatter", input_, output, dim, "roce", "eligible"
-                )
-                return
             comm = self.pynccl_comm
             if dim == 0 and comm is not None and not comm.disabled:
                 comm.reduce_scatter(output, input_.contiguous(), stream=stream)

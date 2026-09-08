@@ -194,7 +194,6 @@ if TYPE_CHECKING:
     VLLM_GLM53_MHC_PREFILL_SHARD: bool = False
     VLLM_GLM53_MHC_MIXED_SHARD: bool = False
     VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD: bool = False
-    VLLM_GLM53_MHC_INPLACE_GATHER: bool = False
     VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS: bool = False
     VLLM_UMA_SERVING_HEADROOM_GIB: float = 0.0
     VLLM_TRIM_STARTUP_HEAP: bool = False
@@ -251,8 +250,6 @@ if TYPE_CHECKING:
     VLLM_ROCE_SUBGROUPS: bool = False
     VLLM_ROCE_CALLER_COLLECTIVES: bool = False
     VLLM_ROCE_CALLER_POLICY: str = "all"
-    VLLM_ROCE_BULK: bool = False
-    VLLM_ROCE_REDUCE_SCATTER: bool = False
     VLLM_ROCE_DIAGNOSTICS: bool = False
     VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
     VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
@@ -1675,9 +1672,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD": lambda: bool(
         int(os.getenv("VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", "0"))
     ),
-    "VLLM_GLM53_MHC_INPLACE_GATHER": lambda: bool(
-        int(os.getenv("VLLM_GLM53_MHC_INPLACE_GATHER", "0"))
-    ),
     # Zero disables serving cache reclamation. This does not change the KV budget.
     "VLLM_UMA_SERVING_HEADROOM_GIB": lambda: float(
         os.getenv("VLLM_UMA_SERVING_HEADROOM_GIB", "0")
@@ -2011,11 +2005,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCE_CALLER_COLLECTIVES": lambda: bool(
         int(os.getenv("VLLM_ROCE_CALLER_COLLECTIVES", "0"))
     ),
-    "VLLM_ROCE_BULK": lambda: bool(int(os.getenv("VLLM_ROCE_BULK", "0"))),
     "VLLM_ROCE_CALLER_POLICY": lambda: os.getenv("VLLM_ROCE_CALLER_POLICY", "all"),
-    "VLLM_ROCE_REDUCE_SCATTER": lambda: bool(
-        int(os.getenv("VLLM_ROCE_REDUCE_SCATTER", "0"))
-    ),
     "VLLM_ROCE_DIAGNOSTICS": lambda: bool(int(os.getenv("VLLM_ROCE_DIAGNOSTICS", "0"))),
     "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))

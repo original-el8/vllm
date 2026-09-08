@@ -54,7 +54,6 @@ def metadata(**changes):
 
 @pytest.fixture
 def admission(monkeypatch):
-    monkeypatch.setenv("VLLM_GLM53_MHC_INPLACE_GATHER", "0")
     monkeypatch.setenv("VLLM_GLM53_MHC_MIXED_SHARD", "0")
     monkeypatch.setenv("VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", "0")
     comm = NS(
@@ -150,17 +149,6 @@ def test_rank_flag_disagreement_rejects_disabled_rank(monkeypatch, admission):
     monkeypatch.setattr(torch.distributed, "all_gather_object", vote)
     with pytest.raises(RuntimeError, match="All TP ranks"):
         ownership.configure(admission.model, admission.config, False)
-
-
-def test_inplace_gather_requires_rank_agreement(monkeypatch, admission):
-    monkeypatch.setenv("VLLM_GLM53_MHC_INPLACE_GATHER", "1")
-
-    def vote(result, value, **kwargs):
-        result[:] = [value, (True, None, False), value, value]
-
-    monkeypatch.setattr(torch.distributed, "all_gather_object", vote)
-    with pytest.raises(RuntimeError, match="agree on mHC in-place"):
-        ownership.configure(admission.model, admission.config, True)
 
 
 @pytest.mark.parametrize(
@@ -263,8 +251,8 @@ def test_mixed_metadata_must_agree_across_recurrent_layers():
 @pytest.mark.parametrize(
     "flag,index,description",
     [
-        ("VLLM_GLM53_MHC_MIXED_SHARD", 3, "mixed"),
-        ("VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", 4, "partial prefill"),
+        ("VLLM_GLM53_MHC_MIXED_SHARD", 2, "mixed"),
+        ("VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", 3, "partial prefill"),
     ],
 )
 def test_batch_flags_require_existing_ownership_and_rank_agreement(
@@ -543,8 +531,6 @@ class CPUFabric:
 
 
 class CPUOwner:
-    inplace_gather = False
-
     def __init__(self, fabric, rank):
         self.fabric, self.rank = fabric, rank
         self.mhc_calls = []
