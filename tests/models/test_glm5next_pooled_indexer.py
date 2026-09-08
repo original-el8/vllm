@@ -323,6 +323,121 @@ def test_mixed_ckv_attention_matches_full_dcp_at_high_pages(owner_merge_group):
         )
 
 
+@pytest.mark.parametrize(
+    "query_lens", [(1, 3, 8, 4096), (*([4] * 15), 7680), (4, 4, 4, 8180)]
+)
+@torch.inference_mode()
+def test_mixed_mhc_model_rows_match_full_reduction(owner_merge_group, query_lens):
+    """Compare full and owned mHC state with uneven mixed rows and real TP sums."""
+    from vllm.distributed.parallel_state import get_tp_group
+    from vllm.models.deepseek_v4.nvidia.b12x import B12xMHCResidual
+    from vllm.models.glm5next.nvidia.mhc_prefill_sharding import PrefillOwnership
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    device = _require_glm_gpu()
+    group = get_tp_group()
+    assert group.world_size == 4
+    init_workspace_manager(device)
+    rank, rows = group.rank_in_group, sum(query_lens)
+    owner = PrefillOwnership(
+        comm=group.device_communicator.pynccl_comm,
+        dispatcher=group.device_communicator,
+        rank=rank,
+        rows=rows,
+    )
+    request_ids = torch.repeat_interleave(
+        torch.arange(len(query_lens), device=device),
+        torch.tensor(query_lens, device=device),
+    )
+    row = torch.arange(rows, device=device, dtype=torch.float32)[:, None]
+    column = torch.arange(4096, device=device, dtype=torch.float32)[None, :]
+    x = (row * 0.019 + column * 0.031).sin().to(torch.bfloat16)
+    residual = torch.stack([x * (0.5 + i / 4) for i in range(4)], 1)
+    post = (row * 0.007 + torch.arange(4, device=device)[None]).sin().sigmoid()
+    comb = torch.arange(16, device=device, dtype=torch.float32).reshape(1, 4, 4)
+    comb = (comb + row[:, None] * 0.003).sin().softmax(-1).contiguous()
+    torch.manual_seed(741)
+    fn = torch.randn(24, 16384, device=device) * 0.002
+    scale = torch.ones(3, device=device)
+    base = torch.randn(24, device=device) * 0.01
+    norm = (column[0] * 0.01).sin().mul(0.25).add(1).to(torch.bfloat16)
+    kernel = B12xMHCResidual(
+        hidden_size=4096, hc_mult=4, rms_eps=1e-6, hc_eps=1e-6, sinkhorn_iters=20
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    retained = []
+    with torch.cuda.stream(stream):
+        # Request identity crosses both mHC ownership and decode/prefill boundaries.
+        identity = (
+            request_ids.to(torch.bfloat16)[:, None].expand(rows, 4096).contiguous()
+        )
+        assembled = owner.all_gather(owner.local_view(identity))
+        assert torch.equal(assembled, identity)
+        for mutation in range(2):
+            partial = (x * ((rank + 1) / 16)).contiguous()
+            reduced = group.all_reduce(partial.clone())
+            owned = owner.reduce_scatter(partial)
+            full = kernel.run_post_pre(
+                reduced,
+                residual,
+                post,
+                comb,
+                fn,
+                scale,
+                base,
+                norm_weight=norm,
+                norm_eps=1e-6,
+            )
+            local = kernel.run_post_pre(
+                owned,
+                owner.local_view(residual),
+                owner.local_view(post),
+                owner.local_view(comb),
+                fn,
+                scale,
+                base,
+                norm_weight=norm,
+                norm_eps=1e-6,
+            )
+            actual = owner.all_gather(local[-1])
+            full_post = kernel.run_post(full[-1], *full[:3])
+            local_post = kernel.run_post(local[-1], *local[:3])
+            actual_post = owner.all_gather(local_post)
+            stream.synchronize()
+            for value, expected in zip(local[:3], full[:3]):
+                torch.testing.assert_close(
+                    value, owner.local_view(expected), atol=0.0625, rtol=0.02
+                )
+            for value, expected in ((actual, full[-1]), (actual_post, full_post)):
+                torch.testing.assert_close(value, expected, atol=0.0625, rtol=0.02)
+                cosine = torch.nn.functional.cosine_similarity(
+                    value.float().reshape(1, -1), expected.float().reshape(1, -1)
+                )
+                assert cosine.item() > 0.999
+            retained.append((actual, actual.clone(), actual_post, actual_post.clone()))
+            print(
+                "MIXED_MHC_GPU",
+                {
+                    "rank": rank,
+                    "rows": rows,
+                    "mutation": mutation,
+                    "query_lens": query_lens,
+                    "max_abs_error": (actual - full[-1]).abs().max().item(),
+                    "post_max_abs_error": (actual_post - full_post).abs().max().item(),
+                    "cosine": cosine.item(),
+                },
+                flush=True,
+            )
+            x = actual.mul(0.75).add_(0.125)
+            residual = full[0].mul(0.8)
+            post, comb = full[1:3]
+        for value, saved, final, saved_final in retained:
+            assert torch.equal(value, saved) and torch.equal(final, saved_final)
+    stream.synchronize()
+    group.device_communicator.b12x_ar_comm.check_health()
+
+
 def test_mhc_gather_bound_output_preserves_values_streams_and_replay(owner_merge_group):
     """Compare the serving mHC binding and rank-local NCCL alias with fresh output."""
     from vllm.distributed.parallel_state import get_tp_group
