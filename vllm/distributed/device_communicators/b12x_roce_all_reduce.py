@@ -69,6 +69,7 @@ class B12xRoceAllReduce:
         self._announced_gather = False
         self.bulk_enabled = envs.VLLM_ROCE_BULK
         self.reduce_scatter_enabled = envs.VLLM_ROCE_REDUCE_SCATTER
+        self.caller_policy = envs.VLLM_ROCE_CALLER_POLICY
 
         if device_group is None:
             logger.warning("RoCEnante requires a CUDA process group.")
@@ -87,7 +88,7 @@ class B12xRoceAllReduce:
         if verdict is not None:
             logger.warning("RoCEnante disabled on every rank: %s", verdict)
             return
-        max_size, max_gather = cast(tuple[int, int, bool, bool, bool], limits)[:2]
+        max_size, max_gather = cast(tuple[int, int, bool, bool, bool, str], limits)[:2]
 
         from b12x.comm import roce
 
@@ -117,7 +118,7 @@ class B12xRoceAllReduce:
 
     def _local_capability(
         self,
-    ) -> tuple[str | None, tuple[int, int, bool, bool, bool] | None]:
+    ) -> tuple[str | None, tuple[int, int, bool, bool, bool, str] | None]:
         """Evaluate this rank's ability to take part, without any collective.
 
         Returns:
@@ -135,19 +136,23 @@ class B12xRoceAllReduce:
         if not roce.is_supported(self.device):
             return "needs an integrated GPU with an active RDMA device", None
         try:
+            from b12x.comm.roce.caller_policy import caller_gather_allowed
+
+            caller_gather_allowed(self.caller_policy, "", 0, "", 0, 0)
             limits = (
                 _parse_byte_size(envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE),
                 _parse_byte_size(envs.VLLM_ROCE_ALLGATHER_MAX_SIZE),
                 self.bulk_enabled,
                 envs.VLLM_ROCE_CALLER_COLLECTIVES,
                 self.reduce_scatter_enabled,
+                self.caller_policy,
             )
         except Exception as exc:  # noqa: BLE001 - reported through the vote
             return f"invalid RoCEnante size limit: {exc}", None
         return None, limits
 
     def _exchange_vote(
-        self, reason: str | None, limits: tuple[int, int, bool, bool, bool] | None
+        self, reason: str | None, limits: tuple[int, int, bool, bool, bool, str] | None
     ) -> str | None:
         """Gather every rank's capability result over the CPU group.
 
@@ -159,9 +164,9 @@ class B12xRoceAllReduce:
             None when every rank can proceed with identical limits, else the
             text naming the ranks that cannot or whose limits differ.
         """
-        votes: list[tuple[str | None, tuple[int, int, bool, bool, bool] | None]] = [
-            (None, None)
-        ] * self.world_size
+        votes: list[
+            tuple[str | None, tuple[int, int, bool, bool, bool, str] | None]
+        ] = [(None, None)] * self.world_size
         dist.all_gather_object(votes, (reason, limits), group=self.group)
         failures = [f"rank {i}: {r}" for i, (r, _) in enumerate(votes) if r]
         if failures:
@@ -205,6 +210,20 @@ class B12xRoceAllReduce:
                 envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE,
             )
         return self._runtime.all_reduce(inp)
+
+    def should_caller_all_gather(
+        self, inp: torch.Tensor, dim: int, group_kind: str
+    ) -> bool:
+        from b12x.comm.roce.caller_policy import caller_gather_allowed
+
+        return caller_gather_allowed(
+            self.caller_policy,
+            group_kind,
+            self.world_size,
+            str(inp.dtype),
+            inp.numel() * inp.element_size(),
+            dim,
+        ) and self.should_all_gather(inp, dim)
 
     def should_all_gather(self, inp: torch.Tensor, dim: int) -> bool:
         if self.disabled:

@@ -485,7 +485,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 roce is not None
                 and envs.VLLM_ROCE_CALLER_COLLECTIVES
                 and getattr(roce, "backend_name", None) == "B12X_ROCENANTE"
-                and roce.should_all_gather(input_, dim)
+                and roce.should_caller_all_gather(
+                    input_, dim, self.unique_name.rsplit(":", 1)[0]
+                )
             ):
                 roce.all_gather(input_, dim, out=output, stream=stream)
                 self._trace_collective(
