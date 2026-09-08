@@ -194,6 +194,9 @@ if TYPE_CHECKING:
     VLLM_GLM53_MHC_PREFILL_SHARD: bool = False
     VLLM_GLM53_MHC_MIXED_SHARD: bool = False
     VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD: bool = False
+    VLLM_GLM53_MHC_WIRE_CODEC: str = ""
+    VLLM_GLM53_MHC_WIRE_MODE: str = "a2a"
+    VLLM_GLM53_MHC_WIRE_DUMP: str = ""
     VLLM_GLM53_MHC_PREFILL_DIAGNOSTICS: bool = False
     VLLM_UMA_SERVING_HEADROOM_GIB: float = 0.0
     VLLM_TRIM_STARTUP_HEAP: bool = False
@@ -1672,6 +1675,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD": lambda: bool(
         int(os.getenv("VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD", "0"))
     ),
+    # Block-scaled 8-bit wire codec for the mHC ownership collectives: "" (off),
+    # "i8" or "e4m3". Mode "ag" compresses only the all-gather; "a2a" also
+    # replaces the reduce-scatter with a compressed all-to-all.
+    "VLLM_GLM53_MHC_WIRE_CODEC": lambda: os.getenv("VLLM_GLM53_MHC_WIRE_CODEC", ""),
+    "VLLM_GLM53_MHC_WIRE_MODE": lambda: os.getenv("VLLM_GLM53_MHC_WIRE_MODE", "a2a"),
+    # Directory that receives a few raw mHC collective inputs for offline codec
+    # evaluation; empty disables the dump.
+    "VLLM_GLM53_MHC_WIRE_DUMP": lambda: os.getenv("VLLM_GLM53_MHC_WIRE_DUMP", ""),
     # Zero disables serving cache reclamation. This does not change the KV budget.
     "VLLM_UMA_SERVING_HEADROOM_GIB": lambda: float(
         os.getenv("VLLM_UMA_SERVING_HEADROOM_GIB", "0")

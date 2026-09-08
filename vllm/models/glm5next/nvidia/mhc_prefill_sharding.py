@@ -108,7 +108,13 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
     group = get_tp_group()
     mixed_shard = envs.VLLM_GLM53_MHC_MIXED_SHARD
     partial_shard = envs.VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD
+    wire_codec = envs.VLLM_GLM53_MHC_WIRE_CODEC or None
+    wire_mode = envs.VLLM_GLM53_MHC_WIRE_MODE
     error = None
+    if wire_codec is not None and wire_codec not in ("i8", "e4m3"):
+        error = f"unknown mHC wire codec {wire_codec!r}"
+    elif wire_mode not in ("ag", "a2a"):
+        error = f"unknown mHC wire mode {wire_mode!r}"
     if enabled:
         try:
             captures = config.compilation_config.cudagraph_capture_sizes or []
@@ -148,7 +154,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
     votes: list[Any] = [None] * group.world_size
     torch.distributed.all_gather_object(
         votes,
-        (enabled, error, mixed_shard, partial_shard),
+        (enabled, error, mixed_shard, partial_shard, wire_codec, wire_mode),
         group=group.cpu_group,
     )
     if any(vote[0] != enabled for vote in votes):
@@ -164,7 +170,14 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
         raise RuntimeError("All TP ranks must agree on partial prefill mHC ownership")
     if partial_shard and not enabled:
         raise RuntimeError("Partial prefill mHC requires prefill row ownership")
+    if any(vote[4:6] != (wire_codec, wire_mode) for vote in votes):
+        raise RuntimeError("All TP ranks must agree on the mHC wire codec and mode")
+    if wire_codec is not None and not enabled:
+        raise RuntimeError("The mHC wire codec requires prefill row ownership")
     model._mhc_prefill_enabled = enabled
+    model._mhc_wire_codec = wire_codec
+    model._mhc_wire_mode = wire_mode
+    model._mhc_wire_dump = envs.VLLM_GLM53_MHC_WIRE_DUMP or None
     model._mhc_mixed_shard = mixed_shard
     model._mhc_partial_prefill_shard = partial_shard
     model._mhc_prefill_parallel_config = config.parallel_config
@@ -371,6 +384,12 @@ class PrefillOwnership:
     diagnostic_forward: int = 0
     mhc_rows: dict[str, dict[int, int]] = field(default_factory=dict)
     dispatcher: Any = None
+    # Optional block-scaled 8-bit wire codec ("i8" / "e4m3"); "ag" compresses
+    # the all-gather only, "a2a" also turns the reduce-scatter into a compressed
+    # all-to-all with FP32 accumulation in rank order.
+    wire_codec: str | None = None
+    wire_mode: str = "a2a"
+    wire_dump: str | None = None
 
     def record_mhc(self, stage: str, output: Any) -> None:
         """Count the output rows of an mHC call that returned to the host."""
@@ -409,7 +428,10 @@ class PrefillOwnership:
             raise RuntimeError("mHC reduce-scatter expects a full hidden TP partial")
         output = partial.new_empty((self.rows // 4, 4096))
         stream = current_stream()
-        if self.dispatcher is None:
+        self._maybe_dump("rs", partial)
+        if self.wire_codec is not None and self.wire_mode == "a2a":
+            self._wire_reduce_scatter(partial, output, stream)
+        elif self.dispatcher is None:
             self.comm.reduce_scatter(output, partial, stream=stream)
         else:
             self.dispatcher.reduce_scatter_into(output, partial, stream=stream)
@@ -418,13 +440,68 @@ class PrefillOwnership:
         self.rs_count += 1
         return output
 
+    def _wire_reduce_scatter(self, partial: Any, output: Any, stream: Any) -> None:
+        """Compressed all-to-all: each rank receives its row quarter from every rank."""
+        from vllm.models.glm5next.nvidia import mhc_int8_wire as wire
+
+        codec = self.wire_codec
+        assert codec is not None
+        quarter = self.rows // 4
+        packed = wire.quantize_rows(partial, codec=codec)
+        received = packed.new_empty((4, quarter, wire.ROW_BYTES))
+        received[self.rank].copy_(
+            packed[self.rank * quarter : (self.rank + 1) * quarter]
+        )
+        self.comm.group_start()
+        for peer in range(4):
+            if peer == self.rank:
+                continue
+            self.comm.send(
+                packed[peer * quarter : (peer + 1) * quarter], peer, stream=stream
+            )
+            self.comm.recv(received[peer], peer, stream=stream)
+        self.comm.group_end()
+        wire.accumulate_rows(received, out=output, codec=codec)
+        packed.record_stream(stream)
+        received.record_stream(stream)
+
+    def _maybe_dump(self, kind: str, tensor: Any) -> None:
+        """Save the first few collective inputs of rank 0 for offline codec scoring."""
+        if self.wire_dump is None or self.rank != 0:
+            return
+        import os
+
+        import torch
+
+        count = getattr(self, "_dumped", 0)
+        if count >= 12:
+            return
+        os.makedirs(self.wire_dump, exist_ok=True)
+        torch.save(
+            tensor.detach().cpu(),
+            os.path.join(self.wire_dump, f"{kind}-{count:02d}-{tensor.shape[0]}.pt"),
+        )
+        self._dumped = count + 1
+
     def all_gather(self, owned: Any) -> Any:
         from vllm.utils.torch_utils import current_stream
 
         self._check(owned, self.rows // 4)
         output = owned.new_empty((self.rows, *owned.shape[1:]))
         stream = current_stream()
-        if self.dispatcher is None:
+        self._maybe_dump("ag", owned)
+        if self.wire_codec is not None:
+            from vllm.models.glm5next.nvidia import mhc_int8_wire as wire
+
+            packed = wire.quantize_rows(owned, codec=self.wire_codec)
+            gathered = packed.new_empty((self.rows, wire.ROW_BYTES))
+            self.comm.all_gather(gathered, packed, stream=stream)
+            # Rebuild every row, own rows included, from the wire payload so all
+            # ranks hold the same tensor.
+            wire.dequantize_rows(gathered, out=output, codec=self.wire_codec)
+            packed.record_stream(stream)
+            gathered.record_stream(stream)
+        elif self.dispatcher is None:
             self.comm.all_gather(output, owned, stream=stream)
         else:
             self.dispatcher.all_gather_into(output, owned, stream=stream)
@@ -622,4 +699,7 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         diagnostics=diagnostics,
         diagnostic_kind=kind,
         diagnostic_forward=forward,
+        wire_codec=getattr(model, "_mhc_wire_codec", None),
+        wire_mode=getattr(model, "_mhc_wire_mode", "a2a"),
+        wire_dump=getattr(model, "_mhc_wire_dump", None),
     )
