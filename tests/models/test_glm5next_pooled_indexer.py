@@ -76,6 +76,88 @@ def owner_merge_group():
     destroy_distributed_environment()
 
 
+def test_mhc_gather_bound_output_preserves_values_streams_and_replay(owner_merge_group):
+    """Compare the serving mHC binding and rank-local NCCL alias with fresh output."""
+    from vllm.distributed.parallel_state import get_tp_group
+    from vllm.models.deepseek_v4.nvidia.b12x import B12xMHCResidual
+    from vllm.models.glm5next.nvidia.mhc_prefill_sharding import PrefillOwnership
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    device = _require_glm_gpu()
+    group = get_tp_group()
+    assert group.world_size == 4
+    init_workspace_manager(device)
+    owner = PrefillOwnership(
+        comm=group.device_communicator.pynccl_comm,
+        dispatcher=group.device_communicator,
+        rank=group.rank_in_group,
+        inplace_gather=True,
+    )
+    torch.manual_seed(40 + group.rank_in_group)
+    rows, hidden, mult = 2048, 4096, 4
+    x = torch.randn(rows, hidden, device=device, dtype=torch.bfloat16)
+    residual = torch.randn(rows, mult, hidden, device=device, dtype=torch.bfloat16)
+    post = torch.rand(rows, mult, device=device)
+    comb = torch.randn(rows, mult, mult, device=device).softmax(-1)
+    fn = torch.randn(mult * (mult + 2), mult * hidden, device=device) * 0.01
+    scale = torch.ones(3, device=device)
+    base = torch.randn(mult * (mult + 2), device=device) * 0.01
+    norm = torch.rand(hidden, device=device, dtype=torch.bfloat16) + 0.5
+    kernel = B12xMHCResidual(
+        hidden_size=hidden, hc_mult=mult, rms_eps=1e-6, hc_eps=1e-6, sinkhorn_iters=20
+    )
+
+    def run(inplace):
+        output = owner.gather_buffer(x) if inplace else None
+        result = kernel.run_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            fn,
+            scale,
+            base,
+            norm_weight=norm,
+            norm_eps=1e-6,
+            y_out=owner.local_view(output) if inplace else None,
+        )
+        if inplace:
+            assert result[-1].data_ptr() == owner.local_view(output).data_ptr()
+        return result[:3], owner.all_gather(result[-1], output=output)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    retained = []
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            reference, gathered = run(False)
+            actual, inplace = run(True)
+            stream.synchronize()
+            assert all(torch.equal(a, b) for a, b in zip(actual, reference))
+            assert torch.equal(inplace, gathered)
+            retained.append((inplace, inplace.clone()))
+            x.add_(0.25)
+            residual.mul_(0.75)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured, captured_gather = run(True)
+        for _ in range(3):
+            x.add_(0.125)
+            graph.replay()
+            reference, gathered = run(False)
+            stream.synchronize()
+            assert all(torch.equal(a, b) for a, b in zip(captured, reference))
+            assert torch.equal(captured_gather, gathered)
+        assert all(torch.equal(a, b) for a, b in retained)
+        # An unrelated slice must fail before any rank enters the collective.
+        full = owner.gather_buffer(x)
+        wrong = full.narrow(0, ((group.rank_in_group + 1) % 4) * rows, rows)
+        with pytest.raises(RuntimeError, match="alias its rank"):
+            owner.all_gather(wrong, output=full)
+    stream.synchronize()
+    group.device_communicator.b12x_ar_comm.check_health()
+
+
 @pytest.mark.parametrize(
     ("kind", "dtype", "nbytes", "expected"),
     [

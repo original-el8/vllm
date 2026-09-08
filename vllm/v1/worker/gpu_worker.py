@@ -67,7 +67,12 @@ from vllm.tracing import instrument
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.mem_utils import (
+    MemorySnapshot,
+    ServingMemoryReclaimer,
+    format_gib,
+    memory_profiling,
+)
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -208,6 +213,7 @@ class Worker(WorkerBase):
         self.profiler_config = vllm_config.profiler_config
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self._uma_cache_reclaimer: ServingMemoryReclaimer | None = None
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
@@ -436,6 +442,12 @@ class Worker(WorkerBase):
             )
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
+
+        headroom = envs.VLLM_UMA_SERVING_HEADROOM_GIB
+        if headroom > 0:
+            self._uma_cache_reclaimer = ServingMemoryReclaimer(
+                self.device, int(headroom * GiB_bytes)
+            )
 
         # DSpark target and draft CUDA graphs retain workspace views concurrently.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
@@ -1171,6 +1183,8 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if self._uma_cache_reclaimer is not None:
+            self._uma_cache_reclaimer.maybe_release()
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:

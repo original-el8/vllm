@@ -54,6 +54,7 @@ def metadata(**changes):
 
 @pytest.fixture
 def admission(monkeypatch):
+    monkeypatch.setenv("VLLM_GLM53_MHC_INPLACE_GATHER", "0")
     comm = NS(
         available=True,
         disabled=False,
@@ -142,11 +143,22 @@ def test_unsupported_parallel_config_is_rejected(admission, field, value):
 
 def test_rank_flag_disagreement_rejects_disabled_rank(monkeypatch, admission):
     def vote(result, value, **kwargs):
-        result[:] = [value, (True, None), value, value]
+        result[:] = [value, (True, None, False), value, value]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", vote)
     with pytest.raises(RuntimeError, match="All TP ranks"):
         ownership.configure(admission.model, admission.config, False)
+
+
+def test_inplace_gather_requires_rank_agreement(monkeypatch, admission):
+    monkeypatch.setenv("VLLM_GLM53_MHC_INPLACE_GATHER", "1")
+
+    def vote(result, value, **kwargs):
+        result[:] = [value, (True, None, False), value, value]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", vote)
+    with pytest.raises(RuntimeError, match="agree on mHC in-place"):
+        ownership.configure(admission.model, admission.config, True)
 
 
 @pytest.mark.parametrize(
@@ -314,6 +326,8 @@ class CPUFabric:
 
 
 class CPUOwner:
+    inplace_gather = False
+
     def __init__(self, fabric, rank):
         self.fabric, self.rank = fabric, rank
         self.mhc_calls = []
@@ -327,7 +341,8 @@ class CPUOwner:
     def reduce_scatter(self, value):
         return self.fabric.exchange(self.rank, "rs", value)
 
-    def all_gather(self, value):
+    def all_gather(self, value, output=None):
+        assert output is None
         return self.fabric.exchange(self.rank, "ag", value)
 
     def finish(self, layers, auxiliary_gathers):

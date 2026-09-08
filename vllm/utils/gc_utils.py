@@ -2,15 +2,80 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import json
+import threading
 import time
 from collections import Counter
 from contextlib import suppress
 from typing import Any
 
+import psutil
+
 import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+_host_heap_trim_thread: threading.Thread | None = None
+
+
+class HostMemoryReclaimer:
+    """Release free libc pages under host pressure without calling CUDA APIs."""
+
+    def __init__(self, headroom_bytes: int) -> None:
+        import ctypes
+
+        self.headroom_bytes = headroom_bytes
+        self.trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if self.trim is not None:
+            self.trim.argtypes = [ctypes.c_size_t]
+            self.trim.restype = ctypes.c_int
+        self.process = psutil.Process()
+
+    def maybe_release(self) -> int:
+        if self.trim is None or self.headroom_bytes <= 0:
+            return 0
+        if psutil.virtual_memory().available >= self.headroom_bytes:
+            return 0
+        before = self.process.memory_info().rss
+        start = time.monotonic()
+        returned_pages = self.trim(0)
+        released = max(0, before - self.process.memory_info().rss)
+        if returned_pages:
+            logger.info(
+                "SERVING_HEAP_TRIM rss_decrease=%.3fMiB elapsed_ms=%.3f",
+                released / 2**20,
+                (time.monotonic() - start) * 1000,
+            )
+        return released
+
+
+def _start_host_heap_trim() -> None:
+    global _host_heap_trim_thread
+    interval = envs.VLLM_TRIM_SERVING_HEAP_INTERVAL
+    headroom = envs.VLLM_UMA_SERVING_HEADROOM_GIB
+    if interval <= 0 or headroom <= 0:
+        return
+    if _host_heap_trim_thread is not None and _host_heap_trim_thread.is_alive():
+        return
+    reclaimer = HostMemoryReclaimer(int(headroom * 2**30))
+    if reclaimer.trim is None:
+        logger.warning("Serving heap trimming requires a libc with malloc_trim")
+        return
+
+    def run() -> None:
+        while True:
+            time.sleep(max(1.0, interval))
+            try:
+                reclaimer.maybe_release()
+            except Exception:
+                logger.exception("Serving heap trimming stopped after an error")
+                return
+
+    # Startup has already created serving subprocesses. A daemon exits with
+    # its process and does not delay shutdown or create another CUDA context.
+    _host_heap_trim_thread = threading.Thread(
+        target=run, name="vllm-host-heap-trim", daemon=True
+    )
+    _host_heap_trim_thread.start()
 
 
 class GCDebugConfig:
@@ -106,6 +171,19 @@ def freeze_gc_heap() -> None:
     gc.collect(2)
     # Freeze all GC tracked objects
     gc.freeze()
+    if envs.VLLM_TRIM_STARTUP_HEAP:
+        import ctypes
+
+        trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+        if trim is None:
+            logger.warning("Startup heap trimming requires a libc with malloc_trim")
+            return
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        # Initialization leaves free libc pages in API and coordinator heaps.
+        released = trim(0)
+        logger.info("STARTUP_HEAP_TRIM released_pages=%s", bool(released))
+    _start_host_heap_trim()
 
 
 def maybe_attach_gc_debug_callback() -> None:

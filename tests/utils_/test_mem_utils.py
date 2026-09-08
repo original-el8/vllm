@@ -1,13 +1,84 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from vllm_test_utils.monitor import monitor
 
+from vllm.utils import mem_utils
+from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 
 from ..utils import create_new_process_for_each_test
+
+
+def test_serving_reclaim_preserves_live_memory_and_requires_growth(monkeypatch):
+    """Cache pressure may trigger one trim; unreleasable pools cannot loop it."""
+    state = SimpleNamespace(reserved=77, allocated=73, available=11, now=1.0)
+    events = []
+    monkeypatch.setattr(mem_utils.time, "monotonic", lambda: state.now)
+    monkeypatch.setattr(mem_utils.current_platform, "is_integrated_gpu", lambda _: True)
+    monkeypatch.setattr(
+        mem_utils.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=state.available * GiB_bytes),
+    )
+    monkeypatch.setattr(
+        torch.accelerator, "memory_reserved", lambda _: state.reserved * GiB_bytes
+    )
+    monkeypatch.setattr(
+        torch.accelerator, "memory_allocated", lambda _: state.allocated * GiB_bytes
+    )
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda _: events.append("sync")
+    )
+
+    def trim():
+        events.append("trim")
+        state.reserved = state.allocated + 2  # Graph pools retain 2 GiB.
+
+    monkeypatch.setattr(torch.accelerator, "empty_cache", trim)
+    reclaimer = mem_utils.ServingMemoryReclaimer(
+        torch.device("cuda", 0), 14 * GiB_bytes
+    )
+    assert reclaimer.maybe_release() == 2 * GiB_bytes
+    assert events == ["sync", "trim"] and state.allocated == 73
+    state.now += 2
+    assert reclaimer.maybe_release() == 0
+    state.reserved += 1
+    assert reclaimer.maybe_release() == 0  # The preceding check starts a cooldown.
+    state.now += 2
+    state.available = 15
+    assert reclaimer.maybe_release() == 0
+    state.now += 2
+    state.available = 11
+    assert reclaimer.maybe_release() == GiB_bytes
+    assert events == ["sync", "trim", "sync", "trim"]
+    # Pending outputs can be freed without any increase in reserved memory.
+    state.now += 2
+    state.allocated -= 0.5
+    assert reclaimer.maybe_release() == GiB_bytes // 2
+    assert state.allocated == 72.5
+
+
+@pytest.mark.parametrize("integrated,headroom", [(False, 14), (True, 0)])
+def test_disabled_serving_reclaim_does_not_access_allocator(
+    monkeypatch, integrated, headroom
+):
+    monkeypatch.setattr(
+        mem_utils.current_platform, "is_integrated_gpu", lambda _: integrated
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "memory_reserved",
+        lambda _: pytest.fail("Disabled policy must not inspect the allocator"),
+    )
+    reclaimer = mem_utils.ServingMemoryReclaimer(
+        torch.device("cuda", 0), headroom * GiB_bytes
+    )
+    assert reclaimer.maybe_release() == 0
 
 
 @create_new_process_for_each_test()

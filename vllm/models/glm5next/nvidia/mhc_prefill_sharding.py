@@ -104,6 +104,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
     from vllm.distributed import get_tp_group
 
     group = get_tp_group()
+    inplace_gather = envs.VLLM_GLM53_MHC_INPLACE_GATHER
     error = None
     if enabled:
         try:
@@ -142,13 +143,20 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
         except (AttributeError, RuntimeError, AssertionError) as exc:
             error = str(exc)
     votes: list[Any] = [None] * group.world_size
-    torch.distributed.all_gather_object(votes, (enabled, error), group=group.cpu_group)
+    torch.distributed.all_gather_object(
+        votes, (enabled, error, inplace_gather), group=group.cpu_group
+    )
     if any(vote[0] != enabled for vote in votes):
         raise RuntimeError("All TP ranks must agree on VLLM_GLM53_MHC_PREFILL_SHARD")
     errors = [vote[1] for vote in votes if vote[1] is not None]
     if errors:
         raise RuntimeError("GLM mHC configuration admission failed: " + repr(errors))
+    if any(vote[2] != inplace_gather for vote in votes):
+        raise RuntimeError("All TP ranks must agree on mHC in-place gathering")
+    if inplace_gather and not enabled:
+        raise RuntimeError("mHC in-place gathering requires prefill row ownership")
     model._mhc_prefill_enabled = enabled
+    model._mhc_inplace_gather = inplace_gather
     model._mhc_prefill_parallel_config = config.parallel_config
     model._mhc_prefill_diagnostics = (
         PrefillDiagnostics(group.rank_in_group)
@@ -293,6 +301,7 @@ class PrefillOwnership:
     diagnostic_forward: int = 0
     mhc_rows: dict[str, dict[int, int]] = field(default_factory=dict)
     dispatcher: Any = None
+    inplace_gather: bool = False
 
     def record_mhc(self, stage: str, output: Any) -> None:
         """Count the output rows of an mHC call that returned to the host."""
@@ -340,11 +349,26 @@ class PrefillOwnership:
         self.rs_count += 1
         return output
 
-    def all_gather(self, owned: Any) -> Any:
+    def gather_buffer(self, owned: Any) -> Any:
+        """Allocate a distinct gather result whose local slice can receive mHC."""
+        self._check(owned, self.rows // 4)
+        return owned.new_empty((self.rows, *owned.shape[1:]))
+
+    def all_gather(self, owned: Any, output: Any = None) -> Any:
         from vllm.utils.torch_utils import current_stream
 
         self._check(owned, self.rows // 4)
-        output = owned.new_empty((self.rows, *owned.shape[1:]))
+        if output is None:
+            output = self.gather_buffer(owned)
+        else:
+            self._check(output, self.rows)
+            if (
+                tuple(output.shape) != (self.rows, *owned.shape[1:])
+                or owned.data_ptr() != self.local_view(output).data_ptr()
+            ):
+                raise RuntimeError(
+                    "mHC gather input must alias its rank's output slice"
+                )
         stream = current_stream()
         if self.dispatcher is None:
             self.comm.all_gather(output, owned, stream=stream)
@@ -488,6 +512,7 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         diagnostics.admitted += 1
         forward = diagnostics.admitted
     return PrefillOwnership(
+        inplace_gather=model._mhc_inplace_gather,
         dispatcher=group.device_communicator,
         comm=comm,
         rank=group.rank_in_group,
