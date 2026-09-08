@@ -12,6 +12,7 @@ from typing import Any, cast
 _LOG = logging.getLogger(__name__)
 _REPORTS = 0
 _MIXED_REPORTS = 0
+_PARTIAL_REPORTS = 0
 
 
 @dataclass
@@ -107,6 +108,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
     group = get_tp_group()
     inplace_gather = envs.VLLM_GLM53_MHC_INPLACE_GATHER
     mixed_shard = envs.VLLM_GLM53_MHC_MIXED_SHARD
+    partial_shard = envs.VLLM_GLM53_MHC_PARTIAL_PREFILL_SHARD
     error = None
     if enabled:
         try:
@@ -146,7 +148,9 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
             error = str(exc)
     votes: list[Any] = [None] * group.world_size
     torch.distributed.all_gather_object(
-        votes, (enabled, error, inplace_gather, mixed_shard), group=group.cpu_group
+        votes,
+        (enabled, error, inplace_gather, mixed_shard, partial_shard),
+        group=group.cpu_group,
     )
     if any(vote[0] != enabled for vote in votes):
         raise RuntimeError("All TP ranks must agree on VLLM_GLM53_MHC_PREFILL_SHARD")
@@ -161,9 +165,14 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
         raise RuntimeError("All TP ranks must agree on mixed mHC row ownership")
     if mixed_shard and not enabled:
         raise RuntimeError("Mixed mHC requires prefill row ownership")
+    if any(vote[4] != partial_shard for vote in votes):
+        raise RuntimeError("All TP ranks must agree on partial prefill mHC ownership")
+    if partial_shard and not enabled:
+        raise RuntimeError("Partial prefill mHC requires prefill row ownership")
     model._mhc_prefill_enabled = enabled
     model._mhc_inplace_gather = inplace_gather
     model._mhc_mixed_shard = mixed_shard
+    model._mhc_partial_prefill_shard = partial_shard
     model._mhc_prefill_parallel_config = config.parallel_config
     model._mhc_prefill_diagnostics = (
         PrefillDiagnostics(group.rank_in_group)
@@ -206,10 +215,10 @@ def pure_prefill_metadata(metadata: Any, names: tuple[str, ...], rows: int) -> b
     return True
 
 
-def mixed_prefill_metadata(
-    metadata: Any, names: tuple[str, ...], rows: int
+def _eager_prefill_metadata(
+    metadata: Any, names: tuple[str, ...], rows: int, *, mixed: bool
 ) -> tuple[int, ...] | None:
-    """Admit complete, consistent host counts for a large eager mixed batch."""
+    """Require complete host counts and consistent request geometry per layer."""
     if (
         not isinstance(metadata, dict)
         or not names
@@ -238,7 +247,7 @@ def mixed_prefill_metadata(
             prefills <= 0
             or prefill_rows < 4096
             or prefills + decodes + specs > 16
-            or decodes + specs <= 0
+            or (decodes + specs > 0) != mixed
             or decode_rows != decodes
             or not specs <= spec_rows <= 4 * specs
             or prefill_rows + decode_rows + spec_rows != rows
@@ -248,6 +257,22 @@ def mixed_prefill_metadata(
             return None
         signature = values
     return signature
+
+
+def mixed_prefill_metadata(
+    metadata: Any, names: tuple[str, ...], rows: int
+) -> tuple[int, ...] | None:
+    """Admit large eager prefills with ordinary or speculative decode rows."""
+    return _eager_prefill_metadata(metadata, names, rows, mixed=True)
+
+
+def partial_prefill_metadata(
+    metadata: Any, names: tuple[str, ...], rows: int
+) -> tuple[int, ...] | None:
+    """Admit large pure prefills below the existing full-chunk row count."""
+    if rows >= 8192:
+        return None
+    return _eager_prefill_metadata(metadata, names, rows, mixed=False)
 
 
 def validate_moe_deferral(runner: Any) -> None:
@@ -474,7 +499,7 @@ class PrefillOwnership:
 
 
 def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | None:
-    global _MIXED_REPORTS
+    global _MIXED_REPORTS, _PARTIAL_REPORTS
     diagnostics = getattr(model, "_mhc_prefill_diagnostics", None)
     if not getattr(model, "_mhc_prefill_enabled", False):
         if diagnostics is not None:
@@ -487,8 +512,9 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         return None
     rows = hidden.shape[0]
     mixed_enabled = model._mhc_mixed_shard
+    partial_enabled = model._mhc_partial_prefill_shard
     shape_eligible = tuple(hidden.shape) == (8192, 4096) or (
-        mixed_enabled
+        (mixed_enabled or partial_enabled)
         and len(hidden.shape) == 2
         and hidden.shape[1] == 4096
         and 4096 <= rows <= 8192
@@ -542,6 +568,12 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         if mixed_enabled
         else None
     )
+    partial_signature = (
+        partial_prefill_metadata(context.attn_metadata, names, rows)
+        if partial_enabled
+        else None
+    )
+    signature = mixed_signature or partial_signature
     eligible = (
         error is None
         and positions.shape[0] == rows
@@ -549,7 +581,7 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         and hidden.dtype == torch.bfloat16
         and (
             pure_prefill_metadata(context.attn_metadata, names, rows)
-            or mixed_signature is not None
+            or signature is not None
         )
     )
     if diagnostics is not None:
@@ -567,7 +599,7 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
     # incompatible reduction paths after one rank has produced partial output.
     votes: list[Any] = [None] * 4
     torch.distributed.all_gather_object(
-        votes, (eligible, error, rows, mixed_signature), group=group.cpu_group
+        votes, (eligible, error, rows, signature), group=group.cpu_group
     )
     errors = [item[1] for item in votes if item[1] is not None]
     if errors:
@@ -595,6 +627,15 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
             mixed_signature,
         )
         _MIXED_REPORTS += 1
+    if partial_signature is not None and _PARTIAL_REPORTS < 8:
+        _LOG.info(
+            "GLM_MHC_PARTIAL rank=%d rows=%d owner_rows=%d metadata=%s",
+            group.rank_in_group,
+            rows,
+            rows // 4,
+            partial_signature,
+        )
+        _PARTIAL_REPORTS += 1
     return PrefillOwnership(
         inplace_gather=model._mhc_inplace_gather,
         dispatcher=group.device_communicator,
