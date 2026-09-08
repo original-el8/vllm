@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from typing import Any
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -78,6 +80,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if use_b12x_allreduce or use_roce_allreduce:
                 use_flashinfer_allreduce = False
 
+        if (
+            unique_name.rsplit(":", 1)[0] in ("dcp", "query_split")
+            and envs.VLLM_ROCE_SUBGROUPS
+            and envs.VLLM_ENABLE_ROCE_ALLREDUCE
+        ):
+            from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
+
+            use_roce_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
@@ -112,7 +123,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
-        self.b12x_ar_comm = None
+        self.b12x_ar_comm: Any = None
 
         if self.use_b12x_allreduce and self.world_size > 1:
             from .b12x_pcie_all_reduce import B12xPcieAllReduce
@@ -412,6 +423,138 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if ca_comm is None:
             return None
         return ca_comm.custom_reduce_scatter(input_.contiguous())
+
+    def _trace_collective(self, operation, input_, output, dim, backend, reason):
+        if not envs.VLLM_ROCE_DIAGNOSTICS:
+            return
+        capturing = torch.cuda.is_current_stream_capturing()
+        key = (operation, tuple(input_.shape), dim, input_.dtype, backend, capturing)
+        counts: dict[tuple, int] | None = getattr(self, "_roce_dispatch_counts", None)
+        if counts is None:
+            counts = self._roce_dispatch_counts = {}
+        if key not in counts and len(counts) >= 256:
+            return
+        count = counts[key] = counts.get(key, 0) + 1
+        if count == 1 or count % 1024 == 0:
+            logger.info(
+                "RoCEnante dispatch group=%s ranks=%s operation=%s shape=%s "
+                "axis=%d dtype=%s input_bytes=%d output_bytes=%d backend=%s "
+                "reason=%s capture=%s count=%d",
+                self.unique_name,
+                self.ranks,
+                operation,
+                tuple(input_.shape),
+                dim,
+                input_.dtype,
+                input_.numel() * input_.element_size(),
+                output.numel() * output.element_size(),
+                backend,
+                reason,
+                capturing,
+                count,
+            )
+
+    def all_gather_into(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        *,
+        dim: int = 0,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Gather into caller storage on the supplied stream.
+
+        Eligibility depends on uniform tensor metadata. Once a transport
+        launches, failures propagate without retrying through another backend.
+        """
+        dim = dim + input_.ndim if dim < 0 else dim
+        if not 0 <= dim < input_.ndim:
+            raise ValueError("all-gather axis is outside the input dimensions")
+        shape = list(input_.shape)
+        shape[dim] *= self.world_size
+        if (
+            list(output.shape) != shape
+            or output.dtype != input_.dtype
+            or output.device != input_.device
+            or not output.is_contiguous()
+        ):
+            raise ValueError("all-gather output has incompatible metadata")
+        with torch.cuda.stream(stream):
+            roce = self.b12x_ar_comm
+            if (
+                roce is not None
+                and envs.VLLM_ROCE_CALLER_COLLECTIVES
+                and getattr(roce, "backend_name", None) == "B12X_ROCENANTE"
+                and roce.should_all_gather(input_, dim)
+            ):
+                roce.all_gather(input_, dim, out=output, stream=stream)
+                self._trace_collective(
+                    "all_gather", input_, output, dim, "roce", "eligible"
+                )
+                return
+            comm = self.pynccl_comm
+            if dim == 0 and comm is not None and not comm.disabled:
+                comm.all_gather(output, input_.contiguous(), stream=stream)
+                self._trace_collective(
+                    "all_gather",
+                    input_,
+                    output,
+                    dim,
+                    "pynccl",
+                    "roce_unavailable_or_ineligible",
+                )
+                return
+            output.copy_(self.all_gather(input_, dim))
+
+    def reduce_scatter_into(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        *,
+        dim: int = 0,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Reduce into caller storage; unsupported RoCE reductions use NCCL."""
+        dim = dim + input_.ndim if dim < 0 else dim
+        if not 0 <= dim < input_.ndim:
+            raise ValueError("reduce-scatter axis is outside the input dimensions")
+        shape = list(input_.shape)
+        if shape[dim] % self.world_size:
+            raise ValueError("reduce-scatter axis must divide evenly across ranks")
+        shape[dim] //= self.world_size
+        if (
+            list(output.shape) != shape
+            or output.dtype != input_.dtype
+            or output.device != input_.device
+            or not output.is_contiguous()
+        ):
+            raise ValueError("reduce-scatter output has incompatible metadata")
+        with torch.cuda.stream(stream):
+            roce = self.b12x_ar_comm
+            if (
+                roce is not None
+                and envs.VLLM_ROCE_CALLER_COLLECTIVES
+                and getattr(roce, "backend_name", None) == "B12X_ROCENANTE"
+                and roce.should_reduce_scatter(input_, dim)
+            ):
+                roce.reduce_scatter(input_, out=output, stream=stream)
+                self._trace_collective(
+                    "reduce_scatter", input_, output, dim, "roce", "eligible"
+                )
+                return
+            comm = self.pynccl_comm
+            if dim == 0 and comm is not None and not comm.disabled:
+                comm.reduce_scatter(output, input_.contiguous(), stream=stream)
+                self._trace_collective(
+                    "reduce_scatter",
+                    input_,
+                    output,
+                    dim,
+                    "pynccl",
+                    "roce_reduce_scatter_unsupported",
+                )
+                return
+            output.copy_(self.reduce_scatter(input_, dim))
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Route uniform dim-0 all-gathers through NVLS symmetric memory when

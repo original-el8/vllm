@@ -1501,7 +1501,15 @@ def graph_capture(
         torch.cuda.Stream(device=device)
     )
     with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
-        yield context
+        from contextlib import ExitStack
+
+        with ExitStack() as subgroups:
+            for group in (_DCP, _QUERY_SPLIT):
+                if group is not None:
+                    comm = getattr(group.device_communicator, "b12x_ar_comm", None)
+                    if comm is not None and not comm.disabled:
+                        subgroups.enter_context(comm.capture(stream=context.stream))
+            yield context
 
 
 logger = init_logger(__name__)

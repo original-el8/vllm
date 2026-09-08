@@ -292,6 +292,7 @@ class PrefillOwnership:
     diagnostic_kind: str = "request"
     diagnostic_forward: int = 0
     mhc_rows: dict[str, dict[int, int]] = field(default_factory=dict)
+    dispatcher: Any = None
 
     def record_mhc(self, stage: str, output: Any) -> None:
         """Count the output rows of an mHC call that returned to the host."""
@@ -330,7 +331,10 @@ class PrefillOwnership:
             raise RuntimeError("mHC reduce-scatter expects a full hidden TP partial")
         output = partial.new_empty((self.rows // 4, 4096))
         stream = current_stream()
-        self.comm.reduce_scatter(output, partial, stream=stream)
+        if self.dispatcher is None:
+            self.comm.reduce_scatter(output, partial, stream=stream)
+        else:
+            self.dispatcher.reduce_scatter_into(output, partial, stream=stream)
         partial.record_stream(stream)
         output.record_stream(stream)
         self.rs_count += 1
@@ -342,7 +346,10 @@ class PrefillOwnership:
         self._check(owned, self.rows // 4)
         output = owned.new_empty((self.rows, *owned.shape[1:]))
         stream = current_stream()
-        self.comm.all_gather(output, owned, stream=stream)
+        if self.dispatcher is None:
+            self.comm.all_gather(output, owned, stream=stream)
+        else:
+            self.dispatcher.all_gather_into(output, owned, stream=stream)
         owned.record_stream(stream)
         output.record_stream(stream)
         self.ag_count += 1
@@ -481,6 +488,7 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         diagnostics.admitted += 1
         forward = diagnostics.admitted
     return PrefillOwnership(
+        dispatcher=group.device_communicator,
         comm=comm,
         rank=group.rank_in_group,
         diagnostics=diagnostics,

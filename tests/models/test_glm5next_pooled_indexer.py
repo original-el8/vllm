@@ -53,8 +53,8 @@ def owner_merge_group():
     )
 
     torch.accelerator.set_device_index(int(os.environ["LOCAL_RANK"]))
-    # These tests exercise NCCL indexer collectives; custom all-reduce is unused.
-    set_custom_all_reduce(False)
+    # Transport qualification explicitly opts into the RoCE adapter.
+    set_custom_all_reduce(os.environ.get("VLLM_ENABLE_ROCE_ALLREDUCE") == "1")
     world_size = int(os.environ["WORLD_SIZE"])
     from vllm.config import VllmConfig, set_current_vllm_config
 

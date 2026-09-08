@@ -28,6 +28,7 @@ Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -43,7 +44,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-REQUIRED_B12X_ROCE_API_VERSION = 1
+REQUIRED_B12X_ROCE_API_VERSION = 2
 
 
 class B12xRoceAllReduce:
@@ -63,9 +64,11 @@ class B12xRoceAllReduce:
         self.device = device
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        self._runtime = None
+        self._runtime: Any = None
         self._announced = False
         self._announced_gather = False
+        self.bulk_enabled = envs.VLLM_ROCE_BULK
+        self.reduce_scatter_enabled = envs.VLLM_ROCE_REDUCE_SCATTER
 
         if device_group is None:
             logger.warning("RoCEnante requires a CUDA process group.")
@@ -84,7 +87,7 @@ class B12xRoceAllReduce:
         if verdict is not None:
             logger.warning("RoCEnante disabled on every rank: %s", verdict)
             return
-        max_size, max_gather = limits
+        max_size, max_gather = cast(tuple[int, int, bool, bool, bool], limits)[:2]
 
         from b12x.comm import roce
 
@@ -112,12 +115,14 @@ class B12xRoceAllReduce:
                 max_gather,
             )
 
-    def _local_capability(self) -> tuple[str | None, tuple[int, int] | None]:
+    def _local_capability(
+        self,
+    ) -> tuple[str | None, tuple[int, int, bool, bool, bool] | None]:
         """Evaluate this rank's ability to take part, without any collective.
 
         Returns:
             A pair of the reason this rank cannot take part (None when it can)
-            and the parsed ``(max_size, max_gather)`` limits (None on failure).
+            and the parsed size limits and dispatch flags (None on failure).
         """
         try:
             from b12x.comm import roce
@@ -133,25 +138,28 @@ class B12xRoceAllReduce:
             limits = (
                 _parse_byte_size(envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE),
                 _parse_byte_size(envs.VLLM_ROCE_ALLGATHER_MAX_SIZE),
+                self.bulk_enabled,
+                envs.VLLM_ROCE_CALLER_COLLECTIVES,
+                self.reduce_scatter_enabled,
             )
         except Exception as exc:  # noqa: BLE001 - reported through the vote
             return f"invalid RoCEnante size limit: {exc}", None
         return None, limits
 
     def _exchange_vote(
-        self, reason: str | None, limits: tuple[int, int] | None
+        self, reason: str | None, limits: tuple[int, int, bool, bool, bool] | None
     ) -> str | None:
         """Gather every rank's capability result over the CPU group.
 
         Args:
             reason: This rank's reason for not taking part, or None.
-            limits: This rank's parsed ``(max_size, max_gather)``, or None.
+            limits: This rank's size limits and dispatch flags, or None.
 
         Returns:
             None when every rank can proceed with identical limits, else the
             text naming the ranks that cannot or whose limits differ.
         """
-        votes: list[tuple[str | None, tuple[int, int] | None]] = [
+        votes: list[tuple[str | None, tuple[int, int, bool, bool, bool] | None]] = [
             (None, None)
         ] * self.world_size
         dist.all_gather_object(votes, (reason, limits), group=self.group)
@@ -199,9 +207,53 @@ class B12xRoceAllReduce:
         return self._runtime.all_reduce(inp)
 
     def should_all_gather(self, inp: torch.Tensor, dim: int) -> bool:
-        return not self.disabled and self._runtime.should_all_gather(inp, dim)
+        if self.disabled:
+            return False
+        if self._runtime.should_all_gather(inp, dim):
+            return True
+        dim = dim + inp.ndim if dim < 0 else dim
+        return (
+            self.bulk_enabled
+            and inp.is_cuda
+            and inp.device == self.device
+            and inp.is_contiguous()
+            and 0 <= dim < inp.ndim
+            and inp.dtype
+            in (
+                torch.bfloat16,
+                torch.float16,
+                torch.float32,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            )
+            and 0 < inp.numel() * inp.element_size() <= 128 << 20
+        )
 
-    def all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
+    def should_reduce_scatter(self, inp: torch.Tensor, dim: int = 0) -> bool:
+        return (
+            not self.disabled
+            and self.bulk_enabled
+            and self.reduce_scatter_enabled
+            and dim == 0
+            and inp.device == self.device
+            and inp.is_contiguous()
+            and inp.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and 0 < inp.numel() * inp.element_size() <= 128 << 20
+            and (inp.numel() * inp.element_size()) % (self.world_size * 16) == 0
+        )
+
+    def reduce_scatter(self, inp, *, out, stream=None):
+        return self._runtime.reduce_scatter(inp, out=out, stream=stream)
+
+    def all_gather(
+        self,
+        inp: torch.Tensor,
+        dim: int,
+        *,
+        out: torch.Tensor | None = None,
+        stream: torch.cuda.Stream | None = None,
+    ) -> torch.Tensor:
         """Concatenate along ``dim`` (0 or last) directly in the output layout."""
 
         if not self._announced_gather:
@@ -214,7 +266,13 @@ class B12xRoceAllReduce:
                 str(inp.dtype).replace("torch.", ""),
                 dim,
             )
-        return self._runtime.all_gather(inp, dim=dim)
+        if self._runtime.should_all_gather(inp, dim):
+            return self._runtime.all_gather(inp, dim=dim, out=out, stream=stream)
+        if out is None:
+            shape = list(inp.shape)
+            shape[dim] *= self.world_size
+            out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+        return self._runtime.segmented_all_gather(inp, dim=dim, out=out, stream=stream)
 
     def supports_fused_add_rms_norm(self) -> bool:
         return False
@@ -228,6 +286,9 @@ class B12xRoceAllReduce:
         # inside a graph.  vLLM's gather shards have 16-byte rows (direct
         # layout), so the padded-gather scratch is not requested here.
         self._runtime.prepare((torch.bfloat16, torch.float16, torch.float32))
+        if self.bulk_enabled and self.reduce_scatter_enabled:
+            self._runtime.prepare_reduce_scatter(torch.bfloat16)
+            self._runtime._reduce_scatter_scratch()
         with self._runtime.capture(stream=stream):
             yield
 

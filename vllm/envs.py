@@ -241,6 +241,11 @@ if TYPE_CHECKING:
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+    VLLM_ROCE_SUBGROUPS: bool = False
+    VLLM_ROCE_CALLER_COLLECTIVES: bool = False
+    VLLM_ROCE_BULK: bool = False
+    VLLM_ROCE_REDUCE_SCATTER: bool = False
+    VLLM_ROCE_DIAGNOSTICS: bool = False
     VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
     VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
@@ -1971,6 +1976,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Maximum input sizes dispatched to the low-latency one-shot kernels.
     # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
+    "VLLM_ROCE_SUBGROUPS": lambda: bool(int(os.getenv("VLLM_ROCE_SUBGROUPS", "0"))),
+    "VLLM_ROCE_CALLER_COLLECTIVES": lambda: bool(
+        int(os.getenv("VLLM_ROCE_CALLER_COLLECTIVES", "0"))
+    ),
+    "VLLM_ROCE_BULK": lambda: bool(int(os.getenv("VLLM_ROCE_BULK", "0"))),
+    "VLLM_ROCE_REDUCE_SCATTER": lambda: bool(
+        int(os.getenv("VLLM_ROCE_REDUCE_SCATTER", "0"))
+    ),
+    "VLLM_ROCE_DIAGNOSTICS": lambda: bool(int(os.getenv("VLLM_ROCE_DIAGNOSTICS", "0"))),
     "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
     ),
