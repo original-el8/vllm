@@ -1677,7 +1677,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Block-scaled 8-bit wire codec for the mHC ownership collectives: "" (off),
     # "i8" or "e4m3". Mode "ag" compresses only the all-gather; "a2a" also
-    # replaces the reduce-scatter with a compressed all-to-all.
+    # replaces the reduce-scatter with a compressed all-to-all over PyNccl
+    # send/recv pairs; "a2a_torch" uses the torch NCCL all-to-all instead.
     "VLLM_GLM53_MHC_WIRE_CODEC": lambda: os.getenv("VLLM_GLM53_MHC_WIRE_CODEC", ""),
     "VLLM_GLM53_MHC_WIRE_MODE": lambda: os.getenv("VLLM_GLM53_MHC_WIRE_MODE", "a2a"),
     # Directory that receives a few raw mHC collective inputs for offline codec

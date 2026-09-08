@@ -204,3 +204,44 @@ def test_triton_kernels_match_reference_on_gpu(codec):
     )
     torch.testing.assert_close(out.float(), expected, rtol=2**-7, atol=1e-6)
     torch.accelerator.synchronize()
+
+
+def test_torch_all_to_all_mode_routes_quarters_by_rank(monkeypatch):
+    from vllm.models.glm5next.nvidia.mhc_prefill_sharding import PrefillOwnership
+
+    monkeypatch.setattr(
+        "vllm.utils.torch_utils.current_stream",
+        lambda: NS(record_stream=lambda t: None),
+    )
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, s: None)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(wire, "_HAS_TRITON", False)
+    rows = 32
+    partials = [_rows(rows, seed=20 + r) for r in range(4)]
+    packed = [wire.quantize_rows(p) for p in partials]
+    calls = []
+
+    def fake_all_to_all_single(output, input_, group=None):
+        rank = group.rank
+        calls.append((rank, tuple(input_.shape), tuple(output.shape)))
+        out = output.view(4, rows // 4, wire.ROW_BYTES)
+        for src in range(4):
+            out[src].copy_(packed[src][rank * rows // 4 : (rank + 1) * rows // 4])
+
+    monkeypatch.setattr("torch.distributed.all_to_all_single", fake_all_to_all_single)
+    for rank in range(4):
+        owner = PrefillOwnership(
+            comm=FakeComm(4, rank, {"ag": [], "p2p": {}}),
+            rank=rank,
+            rows=rows,
+            wire_codec="i8",
+            wire_mode="a2a_torch",
+            torch_group=NS(rank=rank),
+        )
+        out = owner.reduce_scatter(partials[rank])
+        shards = torch.stack(
+            [packed[src][rank * rows // 4 : (rank + 1) * rows // 4] for src in range(4)]
+        )
+        assert torch.equal(out, wire.accumulate_rows(shards))
+        assert not any(c[0] == "send" for c in owner.comm.calls)
+    assert [c[0] for c in calls] == [0, 1, 2, 3]

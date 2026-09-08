@@ -114,7 +114,7 @@ def configure(model: Any, config: Any, enabled: bool) -> None:
     error = None
     if wire_codec is not None and wire_codec not in ("i8", "e4m3"):
         error = f"unknown mHC wire codec {wire_codec!r}"
-    elif wire_mode not in ("ag", "a2a"):
+    elif wire_mode not in ("ag", "a2a", "a2a_torch"):
         error = f"unknown mHC wire mode {wire_mode!r}"
     if enabled:
         try:
@@ -391,6 +391,8 @@ class PrefillOwnership:
     wire_codec: str | None = None
     wire_mode: str = "a2a"
     wire_dump: str | None = None
+    # torch process group for the "a2a_torch" mode (NCCL all_to_all_single).
+    torch_group: Any = None
 
     def record_mhc(self, stage: str, output: Any) -> None:
         """Count the output rows of an mHC call that returned to the host."""
@@ -430,7 +432,7 @@ class PrefillOwnership:
         output = partial.new_empty((self.rows // 4, 4096))
         stream = current_stream()
         self._maybe_dump("rs", partial)
-        if self.wire_codec is not None and self.wire_mode == "a2a":
+        if self.wire_codec is not None and self.wire_mode in ("a2a", "a2a_torch"):
             self._wire_reduce_scatter(partial, output, stream)
         elif self.dispatcher is None:
             self.comm.reduce_scatter(output, partial, stream=stream)
@@ -450,18 +452,26 @@ class PrefillOwnership:
         quarter = self.rows // 4
         packed = wire.quantize_rows(partial, codec=codec)
         received = packed.new_empty((4, quarter, wire.ROW_BYTES))
-        received[self.rank].copy_(
-            packed[self.rank * quarter : (self.rank + 1) * quarter]
-        )
-        self.comm.group_start()
-        for peer in range(4):
-            if peer == self.rank:
-                continue
-            self.comm.send(
-                packed[peer * quarter : (peer + 1) * quarter], peer, stream=stream
+        if self.wire_mode == "a2a_torch":
+            import torch.distributed as dist
+
+            # One NCCL all-to-all: quarter p of the packed partial goes to rank p.
+            dist.all_to_all_single(
+                received.view(-1), packed.view(-1), group=self.torch_group
             )
-            self.comm.recv(received[peer], peer, stream=stream)
-        self.comm.group_end()
+        else:
+            received[self.rank].copy_(
+                packed[self.rank * quarter : (self.rank + 1) * quarter]
+            )
+            self.comm.group_start()
+            for peer in range(4):
+                if peer == self.rank:
+                    continue
+                self.comm.send(
+                    packed[peer * quarter : (peer + 1) * quarter], peer, stream=stream
+                )
+                self.comm.recv(received[peer], peer, stream=stream)
+            self.comm.group_end()
         wire.accumulate_rows(received, out=output, codec=codec)
         packed.record_stream(stream)
         received.record_stream(stream)
@@ -707,4 +717,5 @@ def maybe_create(model: Any, hidden: Any, positions: Any) -> PrefillOwnership | 
         wire_codec=getattr(model, "_mhc_wire_codec", None),
         wire_mode=getattr(model, "_mhc_wire_mode", "a2a"),
         wire_dump=getattr(model, "_mhc_wire_dump", None),
+        torch_group=getattr(group, "device_group", None),
     )
