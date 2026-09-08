@@ -122,6 +122,8 @@ def test_uniform_spec_metadata_gpu_preserves_live_values_and_graph_storage(
         assert (owner.spec_token_indx[num_reqs * window :] == -71).all()
         assert (owner.spec_query_start_loc[num_reqs + 1 :] == -71).all()
         assert not owner.spec_sequence_masks[num_reqs:].any()
+
+
 @pytest.fixture(autouse=True)
 def _metadata_uses_unpinned_host_storage(monkeypatch):
     """CPU metadata tests do not require accelerator-pinned allocations."""
