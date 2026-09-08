@@ -12,6 +12,7 @@ from typing import Any, cast
 _LOG = logging.getLogger(__name__)
 _REPORTS = 0
 _MIXED_REPORTS = 0
+_WIRE_DUMPED = 0
 _PARTIAL_REPORTS = 0
 
 
@@ -466,22 +467,26 @@ class PrefillOwnership:
         received.record_stream(stream)
 
     def _maybe_dump(self, kind: str, tensor: Any) -> None:
-        """Save the first few collective inputs of rank 0 for offline codec scoring."""
-        if self.wire_dump is None or self.rank != 0:
+        """Save a few rank-0 collective inputs, spread over depth, for codec scoring."""
+        global _WIRE_DUMPED
+        if self.wire_dump is None or self.rank != 0 or _WIRE_DUMPED >= 16:
+            return
+        index = self.rs_count if kind == "rs" else self.ag_count
+        if index % 11 != 0:
             return
         import os
 
         import torch
 
-        count = getattr(self, "_dumped", 0)
-        if count >= 12:
-            return
         os.makedirs(self.wire_dump, exist_ok=True)
         torch.save(
             tensor.detach().cpu(),
-            os.path.join(self.wire_dump, f"{kind}-{count:02d}-{tensor.shape[0]}.pt"),
+            os.path.join(
+                self.wire_dump,
+                f"{kind}-{_WIRE_DUMPED:02d}-layer{index}-{tensor.shape[0]}.pt",
+            ),
         )
-        self._dumped = count + 1
+        _WIRE_DUMPED += 1
 
     def all_gather(self, owned: Any) -> Any:
         from vllm.utils.torch_utils import current_stream
