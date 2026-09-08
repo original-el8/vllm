@@ -76,6 +76,65 @@ def owner_merge_group():
     destroy_distributed_environment()
 
 
+@pytest.mark.parametrize(
+    ("kind", "dtype", "nbytes", "expected"),
+    [
+        ("dcp", torch.int32, (1 << 20) - 16, "roce"),
+        ("dcp", torch.uint8, 1 << 20, "roce"),
+        ("dcp", torch.uint8, (1 << 20) + 16, "pynccl"),
+        ("dcp", torch.int32, 4 << 20, "pynccl"),
+        ("dcp", torch.bfloat16, 1 << 18, "pynccl"),
+        ("tp", torch.int32, 1 << 18, "pynccl"),
+        ("tp", torch.bfloat16, 16 << 20, "pynccl"),
+    ],
+)
+def test_selective_owner_merge_dispatch_replays_caller_storage(
+    owner_merge_group, monkeypatch, kind, dtype, nbytes, expected
+):
+    """Boundary routing preserves exact data with rank-local pointer alignment."""
+    if os.environ.get("VLLM_ROCE_CALLER_POLICY") != "small_dcp":
+        pytest.skip("requires the selective DCP transport policy")
+    from vllm.distributed.parallel_state import get_tp_group
+
+    group = owner_merge_group if kind == "dcp" else get_tp_group()
+    if group.world_size != 4:
+        pytest.skip("selective policy evidence is specific to four ranks")
+    comm = group.device_communicator
+    adapter = comm.b12x_ar_comm
+    assert adapter is not None and not adapter.disabled
+    adapter._runtime.prepare((torch.bfloat16, torch.float16, torch.float32))
+    count = nbytes // torch.empty((), dtype=dtype).element_size()
+    storage = torch.empty(count + 1, dtype=dtype, device="cuda")
+    inp = storage[1:] if group.rank_in_group == 0 else storage[:-1]
+    inp.copy_(torch.arange(count, device="cuda") % 97 + group.rank_in_group)
+    output_storage = torch.empty(count * 4 + 1, dtype=dtype, device="cuda")
+    out = output_storage[1:] if group.rank_in_group == 1 else output_storage[:-1]
+    reference = torch.empty_like(out)
+    comm.pynccl_comm.all_gather(reference, inp)
+    selected = []
+    monkeypatch.setattr(
+        comm, "_trace_collective", lambda *args: selected.append(args[4])
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        comm.all_gather_into(out, inp, stream=stream)
+    stream.synchronize()
+    adapter.check_health()
+    assert selected == [expected]
+    assert torch.equal(out, reference)
+    graph = torch.cuda.CUDAGraph()
+    with adapter.capture(), torch.cuda.graph(graph):
+        comm.all_gather_into(out, inp)
+    for _ in range(3):
+        inp.add_(1)
+        reference.add_(1)
+        graph.replay()
+        torch.accelerator.synchronize()
+        adapter.check_health()
+        assert torch.equal(out, reference)
+
+
 @pytest.mark.parametrize("transport", ["pynccl", "torch"])
 @pytest.mark.parametrize(
     ("rows", "padding", "interleave"),

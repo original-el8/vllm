@@ -243,6 +243,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
     VLLM_ROCE_SUBGROUPS: bool = False
     VLLM_ROCE_CALLER_COLLECTIVES: bool = False
+    VLLM_ROCE_CALLER_POLICY: str = "all"
     VLLM_ROCE_BULK: bool = False
     VLLM_ROCE_REDUCE_SCATTER: bool = False
     VLLM_ROCE_DIAGNOSTICS: bool = False
@@ -1981,6 +1982,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_ROCE_CALLER_COLLECTIVES", "0"))
     ),
     "VLLM_ROCE_BULK": lambda: bool(int(os.getenv("VLLM_ROCE_BULK", "0"))),
+    "VLLM_ROCE_CALLER_POLICY": lambda: os.getenv("VLLM_ROCE_CALLER_POLICY", "all"),
     "VLLM_ROCE_REDUCE_SCATTER": lambda: bool(
         int(os.getenv("VLLM_ROCE_REDUCE_SCATTER", "0"))
     ),
