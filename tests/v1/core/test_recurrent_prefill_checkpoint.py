@@ -426,6 +426,37 @@ def test_coalescing_stays_exclusive_to_prompt_work_not_to_decodes():
     assert not scheduler._kda_coalescing_prefill_exclusive()
 
 
+def test_budget_shared_with_decodes_retreats_to_a_coalesced_block_boundary():
+    """Three decoding requests take 12 budget tokens; chunks stay coalesced."""
+    cache, manager, scheduler, request = cache_fixture(16228)
+    budget = 8192 - 12
+    # Cold chunk: no retained state lies inside the first 8180 tokens, so the
+    # ordinary aligned split already gives 7680 without a plan.
+    assert scheduler._mamba_block_aligned_split(request, budget) == 7680
+    assert scheduler._recurrent_checkpoint_plan(request, 0, 7680) is None
+    assert cache.allocate_slots(request, 7680, num_lookahead_tokens=3) is not None
+    scheduler._record_coalescing_origin(request, 0, 0, 0, False)
+    request.num_computed_tokens = 7680
+    # Continuation: 7680 + 8180 = 15860 is off the grid; retreat to 15360.
+    assert scheduler._mamba_block_aligned_split(request, budget) == 7680
+    plan = scheduler._recurrent_checkpoint_plan(request, 7680, 15360)
+    assert plan == (7680, 15360, (12288, 14336))
+    assert (
+        cache.allocate_slots(
+            request, 7680, num_lookahead_tokens=3, recurrent_checkpoint_plan=plan
+        )
+        is not None
+    )
+    request.num_computed_tokens = 15360
+    # Final span reaches the prompt end and coalesces its last interior state.
+    assert scheduler._mamba_block_aligned_split(request, 868) == 868
+    assert scheduler._recurrent_checkpoint_plan(request, 15360, 16228) == (
+        15360,
+        16228,
+        (15872,),
+    )
+
+
 def test_two_checkpoint_capacity_keeps_safe_dcp4_fallback():
     _, manager, scheduler, request = cache_fixture(8192, checkpoints=2)
     assert manager.hit_alignment_tokens == 512

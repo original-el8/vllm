@@ -692,10 +692,24 @@ class Scheduler(SchedulerInterface):
             getattr(self, "_kda_coalescing_enabled", False)
             and not num_new_local_computed_tokens
             and not num_external_computed_tokens
-            and self._recurrent_checkpoint_plan(request, start, start + num_new_tokens)
-            is not None
         ):
-            return num_new_tokens
+            end = start + num_new_tokens
+            if self._recurrent_checkpoint_plan(request, start, end) is not None:
+                return num_new_tokens
+            # Decoding requests sharing the step consume a few budget tokens
+            # and leave the chunk end off the block grid, which no plan can
+            # cover. Retreat to the last block boundary inside the budget when
+            # a plan covers that span; the remainder follows in later steps.
+            block_size = self.cache_config.block_size
+            aligned_end = end // block_size * block_size
+            if (
+                end % block_size
+                and end < request.num_prompt_tokens
+                and aligned_end > start
+                and self._recurrent_checkpoint_plan(request, start, aligned_end)
+                is not None
+            ):
+                return aligned_end - start
         if request.use_boundary_checkpoints:
             # Running-state migration still happens in the worker, but these
             # requests publish only semantic endpoints. Stop exactly at the
