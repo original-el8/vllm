@@ -1106,6 +1106,11 @@ class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
 
+    @property
+    def _head_size_v_for_checks(self) -> int:
+        # V head size used for FA support checks. DiffKV impls override this.
+        return self.head_size
+
     def __init__(
         self,
         num_heads: int,
@@ -1180,7 +1185,7 @@ class FlashAttentionImpl(AttentionImpl):
             self.kv_cache_dtype,
             requires_alibi=alibi_slopes is not None,
             head_size=head_size,
-            head_size_v=head_size,
+            head_size_v=self._head_size_v_for_checks,
             has_sinks=sinks is not None,
             requires_softcap=bool(self.logits_soft_cap),
             supports_fa4_hd256=True,

@@ -76,6 +76,10 @@ class FlashAttentionDiffKVBackend(FlashAttentionBackend):
 class FlashAttentionDiffKVImpl(FlashAttentionImpl):
     vllm_flash_attn_version: int | None
 
+    @property
+    def _head_size_v_for_checks(self) -> int:
+        return FlashAttentionDiffKVBackend.head_size_v
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Re-derive the FA version with diff-kv context so that

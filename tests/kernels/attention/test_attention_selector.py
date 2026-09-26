@@ -755,6 +755,32 @@ def test_fa4_hd256_impl_selection(attn_type, sliding_window, expected):
     assert impl.fa4_hd256 == (expected == 4)
 
 
+@blackwell_only
+def test_flash_attn_diffkv_impl_fp8_kv_cache(monkeypatch):
+    """DiffKV (192/128) must check FP8 KV support with its V head size.
+
+    Checking 192/192 falls back to FA2 on Blackwell and rejects the FP8 cache
+    that FA4 supports for 192/128.
+    """
+    from vllm.v1.attention.backends.flash_attn_diffkv import (
+        FlashAttentionDiffKVBackend,
+        FlashAttentionDiffKVImpl,
+    )
+
+    monkeypatch.setattr(FlashAttentionDiffKVBackend, "head_size_v", 128)
+    with _blackwell(_hd256_config(head_size=192, cache_dtype="fp8")):
+        impl = FlashAttentionDiffKVImpl(
+            num_heads=16,
+            head_size=192,
+            scale=192**-0.5,
+            num_kv_heads=2,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8",
+        )
+    assert impl.vllm_flash_attn_version == 4
+
+
 @pytest.fixture
 def blackwell_selection():
     with (
